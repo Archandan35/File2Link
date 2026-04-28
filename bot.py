@@ -9,9 +9,9 @@ from telegram.ext import (
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # ── YOUR CONFIG ─────────────────────────────────────────
-BOT_TOKEN   = "YOUR_BOT_TOKEN"         # from BotFather
-CHANNEL_ID  = -100xxxxxxxxxx           # your private channel ID
-MY_USER_ID  = 987654321                # your Telegram user ID (only you)
+BOT_TOKEN   = "8646945093:AAH5-cYiEL5nqb_QluUcLvmLnVxe-ftlTug"         # from BotFather
+CHANNEL_ID  = -1002599818759          # your private channel ID
+MY_USER_ID  = 26932049              # your Telegram user ID (only you)
 DELETE_AFTER_MINUTES = 60              # auto-delete after 60 mins (1 hr)
 # ────────────────────────────────────────────────────────
 
