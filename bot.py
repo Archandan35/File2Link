@@ -3,7 +3,6 @@ import logging
 import asyncio
 import aiohttp
 from datetime import datetime, timedelta
-from pathlib import Path
 
 from telegram import Update
 from telegram.ext import (
@@ -34,10 +33,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 scheduler = AsyncIOScheduler()
+
+# Always create download folder on startup
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 
-# ── Gofile Upload ──────────────────────────────────────
 async def get_gofile_server():
     async with aiohttp.ClientSession() as session:
         async with session.get("https://api.gofile.io/servers") as r:
@@ -48,7 +48,6 @@ async def get_gofile_server():
 async def upload_to_gofile(file_path: str, filename: str) -> str:
     server = await get_gofile_server()
     url = f"https://{server}.gofile.io/uploadFile"
-
     async with aiohttp.ClientSession() as session:
         with open(file_path, "rb") as f:
             form = aiohttp.FormData()
@@ -57,11 +56,9 @@ async def upload_to_gofile(file_path: str, filename: str) -> str:
                 data = await r.json()
                 if data["status"] == "ok":
                     return data["data"]["downloadPage"]
-                else:
-                    raise Exception(f"Gofile error: {data}")
+                raise Exception(f"Gofile error: {data}")
 
 
-# ── Delete file job ────────────────────────────────────
 async def delete_message_job(bot, chat_id, message_id):
     try:
         await bot.delete_message(chat_id=chat_id, message_id=message_id)
@@ -70,23 +67,21 @@ async def delete_message_job(bot, chat_id, message_id):
         logger.warning(f"⚠️ Could not delete: {e}")
 
 
-# ── Start command ──────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != MY_USER_ID:
         return
     await update.message.reply_text(
         "👋 *Welcome!*\n\n"
-        "Forward any video (even 1GB+) to me:\n"
+        "Forward any video (even 1GB+):\n"
         "1️⃣ I download it from Telegram\n"
         "2️⃣ Upload to Gofile.io\n"
-        "3️⃣ Send you a *direct download link*\n"
+        "3️⃣ Send you a direct download link\n"
         "4️⃣ Auto-delete after 1 hour 🗑\n\n"
-        "⚡ Large files take a few minutes to process.",
+        "⚡ Large files take a few minutes.",
         parse_mode="Markdown"
     )
 
 
-# ── Handle video ───────────────────────────────────────
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id != MY_USER_ID:
@@ -99,8 +94,8 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     status_msg = await update.message.reply_text(
-        "⏳ *Step 1/4:* Forwarding to channel..."
-        , parse_mode="Markdown"
+        "⏳ *Step 1/3:* Forwarding to channel...",
+        parse_mode="Markdown"
     )
 
     try:
@@ -112,97 +107,18 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         channel_msg_id = forwarded.message_id
 
-        # Get filename
-        if message.video:
-            file_name = message.video.file_name or "video.mp4"
-        else:
-            file_name = message.document.file_name or "file.mp4"
-
         await status_msg.edit_text(
-            "⏳ *Step 2/4:* Downloading from Telegram...\n"
-            "_(This may take several minutes for large files)_",
+            "⏳ *Step 2/3:* Downloading from Telegram...\n"
+            "_(Large files take several minutes)_",
             parse_mode="Markdown"
         )
 
-        # Step 2: Download via Telethon (supports 1GB+)
-        file_path = os.path.join(DOWNLOAD_DIR, file_name)
+        # Step 2: Download via Telethon into folder
+        # Let Telethon name the file automatically
+        os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
         async with TelegramClient(
             StringSession(SESSION_STRING), API_ID, API_HASH
         ) as client:
-            await client.download_media(
+            file_path = await client.download_media(
                 forwarded,
-                file=file_path
-            )
-
-        await status_msg.edit_text(
-            "⏳ *Step 3/4:* Uploading to Gofile.io...",
-            parse_mode="Markdown"
-        )
-
-        # Step 3: Upload to Gofile
-        download_link = await upload_to_gofile(file_path, file_name)
-
-        # Step 4: Cleanup local file
-        Path(file_path).unlink(missing_ok=True)
-
-        delete_at = datetime.now() + timedelta(minutes=DELETE_AFTER_MINUTES)
-
-        # Schedule auto-delete from channel
-        scheduler.add_job(
-            delete_message_job,
-            "date",
-            run_date=delete_at,
-            args=[context.bot, CHANNEL_ID, channel_msg_id],
-            id=f"del_{channel_msg_id}"
-        )
-
-        await status_msg.edit_text(
-            f"✅ *Done!*\n\n"
-            f"📁 File: `{file_name}`\n\n"
-            f"🔗 *Direct Download Link:*\n{download_link}\n\n"
-            f"⏰ Channel file deletes at: {delete_at.strftime('%I:%M %p')}\n"
-            f"🗑 Auto-deleted in *{DELETE_AFTER_MINUTES} minutes*",
-            parse_mode="Markdown"
-        )
-
-    except Exception as e:
-        logger.error(f"Error: {e}")
-        await status_msg.edit_text(f"❌ Error: {str(e)}")
-
-
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != MY_USER_ID:
-        return
-    await update.message.reply_text(
-        "Forward any video to get a direct download link!"
-    )
-
-
-async def on_startup(app):
-    scheduler.start()
-    logger.info("✅ Scheduler started")
-
-
-def main():
-    app = (
-        ApplicationBuilder()
-        .token(BOT_TOKEN)
-        .post_init(on_startup)
-        .build()
-    )
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(
-        filters.VIDEO | filters.Document.ALL, handle_video
-    ))
-    app.add_handler(MessageHandler(
-        filters.TEXT & ~filters.COMMAND, handle_text
-    ))
-
-    logger.info("🤖 Bot is running!")
-    app.run_polling()
-
-
-if __name__ == "__main__":
-    main()
