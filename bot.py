@@ -1,26 +1,30 @@
 import os
 import logging
-import asyncio
 from datetime import datetime, timedelta
+
 from telegram import Update
 from telegram.ext import (
-    ApplicationBuilder, MessageHandler,
-    filters, ContextTypes
+    ApplicationBuilder,
+    MessageHandler,
+    CommandHandler,
+    filters,
+    ContextTypes,
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # ── CONFIG ───────────────────────────────────────────────
 BOT_TOKEN            = os.environ.get("BOT_TOKEN")
 CHANNEL_ID           = int(os.environ.get("CHANNEL_ID"))
-MY_USER_ID           = int(os.environ.get("MY_USER_ID"))
+MY_USER_ID           = int(os.environ.get("MY_USER_ID", "0"))
 DELETE_AFTER_MINUTES = 60
 # ────────────────────────────────────────────────────────
 
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    format="%(asctime)s - %(levelname)s - %(message)s",
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+scheduler = AsyncIOScheduler()
 
 
 async def delete_message_job(bot, chat_id, message_id):
@@ -31,16 +35,44 @@ async def delete_message_job(bot, chat_id, message_id):
         logger.warning(f"⚠️ Could not delete {message_id}: {e}")
 
 
+# ── /start command ──
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    real_id = update.effective_user.id
+    stored_id = MY_USER_ID
+
+    logger.info(f"START from user_id={real_id}, stored MY_USER_ID={stored_id}")
+
+    await update.message.reply_text(
+        f"👤 Your Telegram ID: `{real_id}`\n"
+        f"🔧 Bot stored ID: `{stored_id}`\n"
+        f"✅ Match: `{real_id == stored_id}`",
+        parse_mode="Markdown"
+    )
+
+
+# ── /id command ──
+async def get_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    real_id = update.effective_user.id
+    await update.message.reply_text(
+        f"Your user ID is: `{real_id}`",
+        parse_mode="Markdown"
+    )
+
+
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    logger.info(f"Video from user_id={user_id}, MY_USER_ID={MY_USER_ID}")
 
-    # 🔒 Block everyone except you
     if user_id != MY_USER_ID:
-        await update.message.reply_text("⛔ Unauthorized.")
+        await update.message.reply_text(
+            f"⛔ Unauthorized.\n"
+            f"Your ID: `{user_id}`\n"
+            f"Required ID: `{MY_USER_ID}`",
+            parse_mode="Markdown"
+        )
         return
 
     message = update.message
-
     if not (message.video or message.document):
         await update.message.reply_text("⚠️ Please forward a video file.")
         return
@@ -57,11 +89,9 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         channel_msg_id = forwarded.message_id
         clean_id = str(CHANNEL_ID).replace("-100", "")
         link = f"https://t.me/c/{clean_id}/{channel_msg_id}"
-
         delete_at = datetime.now() + timedelta(minutes=DELETE_AFTER_MINUTES)
 
-        # Schedule auto-delete
-        context.application.scheduler.add_job(
+        scheduler.add_job(
             delete_message_job,
             "date",
             run_date=delete_at,
@@ -83,8 +113,18 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != MY_USER_ID:
+    user_id = update.effective_user.id
+    logger.info(f"Text from user_id={user_id}")
+
+    if user_id != MY_USER_ID:
+        await update.message.reply_text(
+            f"⛔ Unauthorized.\n"
+            f"Your ID: `{user_id}`\n"
+            f"Required ID: `{MY_USER_ID}`",
+            parse_mode="Markdown"
+        )
         return
+
     await update.message.reply_text(
         "👋 *Welcome!*\n\n"
         "Forward any video to me and I will:\n"
@@ -95,35 +135,32 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def main():
-    # ── Start scheduler ──
-    scheduler = AsyncIOScheduler()
+async def on_startup(app):
     scheduler.start()
+    logger.info(f"✅ Bot started. MY_USER_ID={MY_USER_ID}")
+
+
+def main():
+    if not BOT_TOKEN:
+        raise ValueError("❌ BOT_TOKEN is missing!")
 
     app = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
+        .post_init(on_startup)
         .build()
     )
 
-    # Attach scheduler to app so handlers can access it
-    app.scheduler = scheduler
-
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("id", get_id))
     app.add_handler(MessageHandler(
         filters.VIDEO | filters.Document.ALL, handle_video
     ))
-    app.add_handler(MessageHandler(filters.TEXT, handle_text))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     logger.info("🤖 Bot is running!")
-
-    # ── This replaces run_polling() for async main ──
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling()
-
-    # Keep running forever
-    await asyncio.Event().wait()
+    app.run_polling()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
