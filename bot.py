@@ -1,6 +1,7 @@
 import os
 import logging
 import aiohttp
+import asyncio
 from datetime import datetime, timedelta
 
 from telegram import Update
@@ -35,25 +36,68 @@ scheduler = AsyncIOScheduler()
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 
-async def get_gofile_server():
+async def get_gofile_server() -> str:
     async with aiohttp.ClientSession() as session:
         async with session.get("https://api.gofile.io/servers") as r:
             data = await r.json()
             return data["data"]["servers"][0]["name"]
 
 
-async def upload_to_gofile(file_path: str, filename: str) -> str:
+async def upload_to_gofile_streaming(
+    client: TelegramClient,
+    tl_message,
+    filename: str,
+    file_size: int,
+    status_msg,
+    context
+) -> str:
+    """Stream file from Telegram directly to Gofile chunk by chunk."""
+
     server = await get_gofile_server()
     url = f"https://{server}.gofile.io/uploadFile"
+
+    # Use a pipe: async generator feeds Gofile upload
+    chunk_size = 1024 * 1024  # 1MB chunks
+    uploaded = 0
+    last_update = 0
+
+    async def file_chunks():
+        nonlocal uploaded, last_update
+        async for chunk in client.iter_download(tl_message, chunk_size=chunk_size):
+            uploaded += len(chunk)
+            percent = (uploaded / file_size * 100) if file_size else 0
+
+            # Update status every 10%
+            if percent - last_update >= 10:
+                last_update = percent
+                size_done = uploaded / (1024 * 1024)
+                size_total = file_size / (1024 * 1024)
+                try:
+                    await status_msg.edit_text(
+                        f"⚡ *Streaming to Gofile...*\n\n"
+                        f"📦 {size_done:.1f} MB / {size_total:.1f} MB\n"
+                        f"📊 Progress: {percent:.0f}%\n\n"
+                        f"_(No local storage used)_",
+                        parse_mode="Markdown"
+                    )
+                except Exception:
+                    pass
+            yield chunk
+
+    # Stream upload using aiohttp
     async with aiohttp.ClientSession() as session:
-        with open(file_path, "rb") as f:
-            form = aiohttp.FormData()
-            form.add_field("file", f, filename=filename)
-            async with session.post(url, data=form) as r:
-                data = await r.json()
-                if data["status"] == "ok":
-                    return data["data"]["downloadPage"]
-                raise Exception(f"Gofile error: {data}")
+        form = aiohttp.FormData()
+        form.add_field(
+            "file",
+            file_chunks(),
+            filename=filename,
+            content_type="application/octet-stream"
+        )
+        async with session.post(url, data=form) as r:
+            data = await r.json()
+            if data["status"] == "ok":
+                return data["data"]["downloadPage"]
+            raise Exception(f"Gofile error: {data}")
 
 
 async def delete_message_job(bot, chat_id, message_id):
@@ -71,18 +115,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 *Welcome!*\n\n"
         "Forward any video (even 1GB+):\n"
-        "1️⃣ Downloads from Telegram\n"
-        "2️⃣ Uploads to Gofile.io\n"
-        "3️⃣ Sends direct download link\n"
-        "4️⃣ Auto-deletes after 1 hour 🗑",
+        "⚡ Streams directly — no wait for full download!\n"
+        "🔗 Get Gofile direct download link\n"
+        "🗑 Auto-deletes after 1 hour",
         parse_mode="Markdown"
     )
 
 
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.info("===== handle_video =====")
     user_id = update.effective_user.id
-
     if user_id != MY_USER_ID:
         await update.message.reply_text("⛔ Unauthorized.")
         return
@@ -92,96 +133,66 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Please forward a video file.")
         return
 
-    # Get file info from original message
     if message.video:
-        file_id   = message.video.file_id
         file_name = message.video.file_name or "video.mp4"
         file_size = message.video.file_size or 0
     else:
-        file_id   = message.document.file_id
         file_name = message.document.file_name or "file.mp4"
         file_size = message.document.file_size or 0
 
     file_size_mb = file_size / (1024 * 1024)
-    logger.info(f"File: {file_name} ({file_size_mb:.1f} MB) file_id: {file_id}")
 
     status_msg = await update.message.reply_text(
-        f"📥 Received: `{file_name}`\n"
-        f"📦 Size: {file_size_mb:.1f} MB\n\n"
-        f"⏳ *Step 1/3:* Forwarding to channel...",
+        f"📥 *{file_name}*\n"
+        f"📦 {file_size_mb:.1f} MB\n\n"
+        f"⏳ Forwarding to channel...",
         parse_mode="Markdown"
     )
 
     try:
-        # Step 1: Forward to private channel
+        # Forward to private channel
         forwarded = await context.bot.forward_message(
             chat_id=CHANNEL_ID,
             from_chat_id=message.chat_id,
             message_id=message.message_id
         )
         channel_msg_id = forwarded.message_id
-        logger.info(f"Forwarded to channel. msg_id: {channel_msg_id}")
+        logger.info(f"Forwarded. channel_msg_id={channel_msg_id}")
 
         await status_msg.edit_text(
-            f"📥 File: `{file_name}` ({file_size_mb:.1f} MB)\n\n"
-            f"⏳ *Step 2/3:* Downloading...\n"
-            f"_(Large files take several minutes)_",
+            f"📥 *{file_name}* ({file_size_mb:.1f} MB)\n\n"
+            f"⚡ *Streaming to Gofile...*\n"
+            f"_(Starting...)_",
             parse_mode="Markdown"
         )
 
-        # Step 2: Download directly using file_id via Telethon
-        os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-        file_path = os.path.join(DOWNLOAD_DIR, file_name)
-
-        logger.info(f"Connecting Telethon to download...")
-
+        # Stream from Telegram → Gofile
         async with TelegramClient(
             StringSession(SESSION_STRING), API_ID, API_HASH
         ) as client:
-            logger.info("Telethon connected. Getting messages from channel...")
+            logger.info("Telethon connected")
 
-            # Get the forwarded message directly from channel using Telethon
-            tl_messages = await client.get_messages(
+            tl_message = await client.get_messages(
                 CHANNEL_ID,
                 ids=channel_msg_id
             )
 
-            logger.info(f"Got message: {tl_messages}")
-
-            if tl_messages is None:
+            if tl_message is None:
                 raise Exception(
-                    "Telethon could not find the message in channel. "
-                    "Make sure your SESSION_STRING account is a MEMBER of the channel."
+                    "Could not find message in channel.\n"
+                    "Make sure your Telegram account is a member of the channel."
                 )
 
-            file_path = await client.download_media(
-                tl_messages,
-                file=file_path
+            download_link = await upload_to_gofile_streaming(
+                client,
+                tl_message,
+                file_name,
+                file_size,
+                status_msg,
+                context
             )
-            logger.info(f"Downloaded to: {file_path}")
 
-        if not file_path or not os.path.exists(file_path):
-            raise Exception(f"Download failed. file_path={file_path}")
-
-        actual_size_mb = os.path.getsize(file_path) / (1024 * 1024)
-
-        await status_msg.edit_text(
-            f"📥 File: `{file_name}`\n\n"
-            f"⏳ *Step 3/3:* Uploading to Gofile.io...\n"
-            f"📦 Size: {actual_size_mb:.1f} MB",
-            parse_mode="Markdown"
-        )
-
-        # Step 3: Upload to Gofile
-        logger.info("Uploading to Gofile...")
-        download_link = await upload_to_gofile(file_path, file_name)
         logger.info(f"Gofile link: {download_link}")
-
-        # Cleanup local file
-        try:
-            os.remove(file_path)
-        except Exception:
-            pass
 
         delete_at = datetime.now() + timedelta(minutes=DELETE_AFTER_MINUTES)
         scheduler.add_job(
@@ -194,8 +205,8 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await status_msg.edit_text(
             f"✅ *Done!*\n\n"
-            f"📁 File: `{file_name}`\n"
-            f"📦 Size: {actual_size_mb:.1f} MB\n\n"
+            f"📁 `{file_name}`\n"
+            f"📦 {file_size_mb:.1f} MB\n\n"
             f"🔗 *Direct Download:*\n{download_link}\n\n"
             f"⏰ Deletes at: {delete_at.strftime('%I:%M %p')}\n"
             f"🗑 Auto-deleted in *{DELETE_AFTER_MINUTES} minutes*",
@@ -220,10 +231,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def on_startup(app):
     scheduler.start()
-    logger.info(f"✅ Bot started!")
-    logger.info(f"MY_USER_ID = {MY_USER_ID}")
-    logger.info(f"CHANNEL_ID = {CHANNEL_ID}")
-    logger.info(f"SESSION    = {'SET' if SESSION_STRING else 'MISSING'}")
+    logger.info(f"✅ Bot started! MY_USER_ID={MY_USER_ID}")
 
 
 def main():
