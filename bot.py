@@ -3,7 +3,6 @@ import re
 import asyncio
 import logging
 import secrets
-from datetime import datetime, timedelta
 
 from aiohttp import web
 from telegram import Update
@@ -14,7 +13,6 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 
@@ -24,18 +22,19 @@ MY_USER_ID           = int(os.environ.get("MY_USER_ID", "0"))
 API_ID               = int(os.environ.get("API_ID"))
 API_HASH             = os.environ.get("API_HASH")
 SESSION_STRING       = os.environ.get("SESSION_STRING", "")
-DELETE_AFTER_MINUTES = int(os.environ.get("DELETE_AFTER_MINUTES", "60"))
 PORT                 = int(os.environ.get("PORT", "8080"))
 BASE_URL             = os.environ.get("BASE_URL", "").rstrip("/")
 BATCH_WAIT_SECONDS   = 3
-# ── CHANNEL_ID no longer needed ─────────────────────────
 
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
-scheduler = AsyncIOScheduler()
+
+# ── Global persistent Telethon client ─────────────────
+# Single client reused for ALL requests = no reconnect delay
+telethon_client: TelegramClient = None
 
 file_store:  dict = {}
 batch_store: dict = {}
@@ -45,10 +44,17 @@ def generate_token() -> str:
     return secrets.token_urlsafe(16)
 
 
-def get_telethon_client():
-    return TelegramClient(
-        StringSession(SESSION_STRING), API_ID, API_HASH
-    )
+async def get_client() -> TelegramClient:
+    """Return the already-connected persistent Telethon client."""
+    global telethon_client
+    if telethon_client is None or not telethon_client.is_connected():
+        logger.info("🔌 Reconnecting Telethon client...")
+        telethon_client = TelegramClient(
+            StringSession(SESSION_STRING), API_ID, API_HASH
+        )
+        await telethon_client.connect()
+        logger.info("✅ Telethon client connected")
+    return telethon_client
 
 
 # ── Web Server ─────────────────────────────────────────
@@ -56,14 +62,9 @@ async def stream_handler(request: web.Request) -> web.Response:
     token = request.match_info.get("token")
 
     if token not in file_store:
-        return web.Response(status=404, text="Link expired or not found.")
+        return web.Response(status=404, text="Link not found.")
 
-    entry = file_store[token]
-
-    if datetime.now() > entry["expires_at"]:
-        del file_store[token]
-        return web.Response(status=410, text="Link has expired.")
-
+    entry     = file_store[token]
     chat_id   = entry["chat_id"]
     msg_id    = entry["msg_id"]
     file_name = entry["file_name"]
@@ -115,36 +116,39 @@ async def stream_handler(request: web.Request) -> web.Response:
     if range_header and file_size:
         headers["Content-Range"] = f"bytes {offset}-{end_byte}/{file_size}"
 
-    async def file_generator():
-        async with get_telethon_client() as client:
-            # Stream directly from bot chat — no channel needed
-            tl_msg = await client.get_messages(chat_id, ids=msg_id)
-            if tl_msg is None:
-                logger.error(f"Message not found: chat={chat_id} msg={msg_id}")
-                return
-            async for chunk in client.iter_download(
-                tl_msg,
-                offset=offset,
-                chunk_size=512 * 1024
-            ):
-                yield chunk
+    # ── StreamResponse for true chunked streaming ──────
+    # Using StreamResponse instead of Response+generator
+    # so bytes reach the browser immediately as they arrive
+    response = web.StreamResponse(status=status, headers=headers)
+    await response.prepare(request)
 
-    return web.Response(
-        status=status,
-        headers=headers,
-        body=file_generator()
-    )
+    try:
+        client   = await get_client()
+        tl_msg   = await client.get_messages(chat_id, ids=msg_id)
+
+        if tl_msg is None:
+            logger.error(f"Message not found: chat={chat_id} msg={msg_id}")
+            return response
+
+        async for chunk in client.iter_download(
+            tl_msg,
+            offset=offset,
+            chunk_size=512 * 1024,      # 512 KB per chunk
+            request_size=512 * 1024,
+        ):
+            await response.write(chunk)
+
+    except ConnectionResetError:
+        # Client closed the browser tab / seek happened — totally normal
+        logger.info("ℹ️ Client disconnected mid-stream (seek or tab close)")
+    except Exception as e:
+        logger.error(f"Stream error: {e}", exc_info=True)
+
+    return response
 
 
 async def index_handler(request: web.Request) -> web.Response:
     return web.Response(text="✅ Bot stream server is running.")
-
-
-# ── Delete job ─────────────────────────────────────────
-async def delete_token(token):
-    """Remove token from store after expiry."""
-    file_store.pop(token, None)
-    logger.info(f"🗑 Token expired and removed: {token}")
 
 
 # ── Process Batch ──────────────────────────────────────
@@ -177,7 +181,6 @@ async def process_batch(
     stream_lines   = []
     total_size_mb  = 0
     failed         = []
-    last_expires   = None
 
     for i, message in enumerate(messages, 1):
         try:
@@ -196,40 +199,26 @@ async def process_batch(
             file_size_mb   = file_size / (1024 * 1024)
             total_size_mb += file_size_mb
 
-            # Generate token FIRST then set expiry
-            token      = generate_token()
-            expires_at = datetime.now() + timedelta(minutes=DELETE_AFTER_MINUTES)
-            last_expires = expires_at
+            token = generate_token()
 
-            # Store with original chat_id and message_id
-            # No forwarding to channel at all
+            # ── No expiry — links live forever ──
             file_store[token] = {
-                "chat_id":    chat_id,
-                "msg_id":     message.message_id,
-                "file_name":  file_name,
-                "file_size":  file_size,
-                "expires_at": expires_at,
+                "chat_id":   chat_id,
+                "msg_id":    message.message_id,
+                "file_name": file_name,
+                "file_size": file_size,
             }
 
             download_url = f"{BASE_URL}/stream/{token}?download=1"
             stream_url   = f"{BASE_URL}/stream/{token}"
 
             download_lines.append(
-                f"⬇️ *Video {i}* : `{file_name}`\n"
+                f"⬇️ *File {i}* : `{file_name}`\n"
                 f"🔗 {download_url}"
             )
             stream_lines.append(
-                f"▶️ *Video {i}* : `{file_name}` — "
+                f"▶️ *File {i}* : `{file_name}` — "
                 f"[Stream Now 🎬]({stream_url})"
-            )
-
-            # Schedule token cleanup only (no message delete)
-            scheduler.add_job(
-                delete_token,
-                "date",
-                run_date=expires_at,
-                args=[token],
-                id=f"del_{token}"
             )
 
             logger.info(f"✅ {i}/{total}: {file_name} token={token}")
@@ -238,14 +227,12 @@ async def process_batch(
             logger.error(f"❌ Failed file {i}: {e}", exc_info=True)
             failed.append(i)
 
-    success_count  = total - len(failed)
-    expire_display = last_expires.strftime("%I:%M %p") if last_expires else "N/A"
+    success_count = total - len(failed)
 
-    # ── Build message ──
-    text  = f"✅ *Ready Instantly!* ({success_count}/{total} files)\n"
+    # ── Build message ──────────────────────────────────
+    text  = f"✅ *Ready!* ({success_count}/{total} files)\n"
     text += f"📦 Total size: {total_size_mb:.1f} MB\n"
-    text += f"⏰ Expires at: {expire_display}\n"
-    text += f"🗑 Links expire in *{DELETE_AFTER_MINUTES} minutes*\n"
+    text += f"🔗 Links are *permanent* — no expiry\n"
 
     text += "\n"
     text += "━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -260,7 +247,7 @@ async def process_batch(
     text += "\n".join(stream_lines)
 
     if failed:
-        text += f"\n\n⚠️ Failed: Video(s) {', '.join(map(str, failed))}"
+        text += f"\n\n⚠️ Failed: File(s) {', '.join(map(str, failed))}"
 
     if len(text) <= 4096:
         await status_msg.edit_text(text, parse_mode="Markdown")
@@ -268,8 +255,7 @@ async def process_batch(
         await status_msg.edit_text(
             f"✅ *Ready!* {success_count}/{total} files\n"
             f"📦 Total: {total_size_mb:.1f} MB\n"
-            f"⏰ Expires: {expire_display}\n"
-            f"🗑 Links expire in *{DELETE_AFTER_MINUTES} minutes*",
+            f"🔗 Links are *permanent*",
             parse_mode="Markdown"
         )
 
@@ -324,8 +310,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "⚡ Instant stream and download links\n"
         "📦 Batch supported — 2 to 100 files\n"
         "🔗 All links in one combined message\n"
-        "🗑 Links auto-expire after set time\n\n"
-        f"⏰ Expiry time: *{DELETE_AFTER_MINUTES} minutes*",
+        "♾️ Links *never expire*",
         parse_mode="Markdown"
     )
 
@@ -367,8 +352,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# ── Startup: connect Telethon ONCE before serving ─────
 async def on_startup(app_obj):
-    scheduler.start()
+    await get_client()          # connect persistent client at boot
     logger.info(f"✅ Bot started! BASE_URL={BASE_URL}")
 
 
@@ -380,16 +366,18 @@ def main():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
+    # ── Start web server ──
     runner = web.AppRunner(web_app)
     loop.run_until_complete(runner.setup())
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     loop.run_until_complete(site.start())
     logger.info(f"🌐 Web server running on port {PORT}")
 
+    # ── Build telegram app ──
     tg_app = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
-        .post_init(on_startup)
+        .post_init(on_startup)   # connects Telethon at startup
         .build()
     )
 
