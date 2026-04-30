@@ -217,8 +217,8 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"✅ *Ready Instantly!*\n\n"
             f"📁 `{file_name}`\n"
             f"📦 {file_size_mb:.1f} MB\n\n"
-            f"⬇️ *Download Link:*\n`{download_link}`\n\n"
-            f"▶️ *Stream Link:*\n`{stream_link}`\n\n"
+            f"⬇️ *Download:* [{download_link}]({download_link})\n\n"
+            f"▶️ *Stream:* [Stream Now 🎬]({stream_link})\n\n"
             f"⏰ Expires at: {expires_at.strftime('%I:%M %p')}\n"
             f"🗑 Auto-deleted in *{DELETE_AFTER_MINUTES} minutes*",
             parse_mode="Markdown"
