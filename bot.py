@@ -4,6 +4,7 @@ import asyncio
 import logging
 import secrets
 import aiosqlite
+import aiohttp as aiohttp_client
 
 from aiohttp import web
 from telegram import Update
@@ -15,8 +16,6 @@ from telegram.ext import (
     ContextTypes,
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from telethon import TelegramClient
-from telethon.sessions import StringSession
 
 # ── CONFIG ───────────────────────────────────────────────
 BOT_TOKEN      = os.environ.get("BOT_TOKEN")
@@ -28,6 +27,7 @@ PORT           = int(os.environ.get("PORT", "8080"))
 BASE_URL       = os.environ.get("BASE_URL", "").rstrip("/")
 DB_PATH        = os.environ.get("DB_PATH", "/tmp/filestore.db")
 BATCH_WAIT     = 3
+TG_API         = "https://api.telegram.org"
 # ────────────────────────────────────────────────────────
 
 logging.basicConfig(
@@ -37,7 +37,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 scheduler   = AsyncIOScheduler()
 batch_store: dict = {}
-telethon_client: TelegramClient = None
 
 
 # ── Database ───────────────────────────────────────────
@@ -49,18 +48,19 @@ async def init_db():
                 chat_id   INTEGER,
                 msg_id    INTEGER,
                 file_name TEXT,
-                file_size INTEGER
+                file_size INTEGER,
+                file_id   TEXT
             )
         """)
         await db.commit()
     logger.info("✅ Database ready")
 
 
-async def save_token(token, chat_id, msg_id, file_name, file_size):
+async def save_token(token, chat_id, msg_id, file_name, file_size, file_id):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "INSERT OR REPLACE INTO files VALUES (?,?,?,?,?)",
-            (token, chat_id, msg_id, file_name, file_size)
+            "INSERT OR REPLACE INTO files VALUES (?,?,?,?,?,?)",
+            (token, chat_id, msg_id, file_name, file_size, file_id)
         )
         await db.commit()
 
@@ -68,7 +68,8 @@ async def save_token(token, chat_id, msg_id, file_name, file_size):
 async def get_token_entry(token):
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
-            "SELECT chat_id, msg_id, file_name, file_size FROM files WHERE token=?",
+            "SELECT chat_id, msg_id, file_name, file_size, file_id "
+            "FROM files WHERE token=?",
             (token,)
         ) as cursor:
             row = await cursor.fetchone()
@@ -78,35 +79,20 @@ async def get_token_entry(token):
                     "msg_id":    row[1],
                     "file_name": row[2],
                     "file_size": row[3],
+                    "file_id":   row[4],
                 }
             return None
-
-
-# ── Telethon ───────────────────────────────────────────
-async def get_client() -> TelegramClient:
-    global telethon_client
-    if telethon_client is None or not telethon_client.is_connected():
-        telethon_client = TelegramClient(
-            StringSession(SESSION_STRING), API_ID, API_HASH
-        )
-        await telethon_client.connect()
-        logger.info("✅ Telethon connected")
-    return telethon_client
 
 
 def generate_token() -> str:
     return secrets.token_urlsafe(16)
 
 
-# ── Content Type Helper ────────────────────────────────
-def get_content_type(file_name: str, is_download: bool) -> tuple:
+def get_mime_type(file_name: str, is_download: bool):
     if is_download:
-        return (
-            f'attachment; filename="{file_name}"',
-            "application/octet-stream"
-        )
+        return f'attachment; filename="{file_name}"', "application/octet-stream"
     ext = file_name.lower().split(".")[-1]
-    content_types = {
+    mime = {
         "mp4":  "video/mp4",
         "mkv":  "video/x-matroska",
         "avi":  "video/x-msvideo",
@@ -118,10 +104,20 @@ def get_content_type(file_name: str, is_download: bool) -> tuple:
         "jpeg": "image/jpeg",
         "png":  "image/png",
     }
-    return (
-        f'inline; filename="{file_name}"',
-        content_types.get(ext, "video/mp4")
-    )
+    return f'inline; filename="{file_name}"', mime.get(ext, "video/mp4")
+
+
+# ── Get direct Telegram file URL ───────────────────────
+async def get_tg_file_url(file_id: str) -> str:
+    """Get direct CDN download URL from Telegram for any file_id."""
+    url = f"{TG_API}/bot{BOT_TOKEN}/getFile?file_id={file_id}"
+    async with aiohttp_client.ClientSession() as session:
+        async with session.get(url) as resp:
+            data = await resp.json()
+            if data.get("ok"):
+                file_path = data["result"]["file_path"]
+                return f"{TG_API}/file/bot{BOT_TOKEN}/{file_path}"
+            raise Exception(f"getFile failed: {data}")
 
 
 # ── Web Server ─────────────────────────────────────────
@@ -132,10 +128,12 @@ async def stream_handler(request: web.Request) -> web.StreamResponse:
     if not entry:
         return web.Response(status=404, text="Link not found.")
 
-    chat_id   = entry["chat_id"]
-    msg_id    = entry["msg_id"]
     file_name = entry["file_name"]
     file_size = entry["file_size"]
+    file_id   = entry["file_id"]
+
+    is_download = "download" in request.query
+    disposition, content_type = get_mime_type(file_name, is_download)
 
     # Parse range header
     range_header = request.headers.get("Range")
@@ -148,50 +146,51 @@ async def stream_handler(request: web.Request) -> web.StreamResponse:
             offset   = int(match.group(1))
             end_byte = int(match.group(2)) if match.group(2) else file_size - 1
 
-    is_download              = "download" in request.query
-    disposition, content_type = get_content_type(file_name, is_download)
+    try:
+        # Get fresh direct URL from Telegram
+        direct_url = await get_tg_file_url(file_id)
+        logger.info(f"Streaming: {file_name} from Telegram CDN")
+    except Exception as e:
+        logger.error(f"getFile error: {e}")
+        return web.Response(status=500, text=f"Failed to get file: {e}")
 
-    # Use StreamResponse so bytes flow immediately to browser
-    response = web.StreamResponse(
-        status=206 if range_header else 200,
-        headers={
-            "Content-Disposition": disposition,
-            "Content-Type":        content_type,
-            "Accept-Ranges":       "bytes",
-            "Cache-Control":       "no-cache",
-            **({"Content-Length": str(end_byte - offset + 1)} if file_size else {}),
-            **({"Content-Range": f"bytes {offset}-{end_byte}/{file_size}"}
-               if range_header and file_size else {}),
-        }
-    )
+    # Build response headers
+    resp_headers = {
+        "Content-Disposition": disposition,
+        "Content-Type":        content_type,
+        "Accept-Ranges":       "bytes",
+        "Cache-Control":       "no-cache",
+    }
 
+    if file_size and end_byte is not None:
+        resp_headers["Content-Length"] = str(end_byte - offset + 1)
+
+    if range_header and file_size:
+        resp_headers["Content-Range"] = f"bytes {offset}-{end_byte}/{file_size}"
+
+    status = 206 if range_header else 200
+
+    # Stream from Telegram CDN directly to browser
+    response = web.StreamResponse(status=status, headers=resp_headers)
     await response.prepare(request)
 
+    req_headers = {}
+    if range_header:
+        req_headers["Range"] = range_header
+
     try:
-        client = await get_client()
-        tl_msg = await client.get_messages(chat_id, ids=msg_id)
-
-        if tl_msg is None:
-            logger.error(f"Message not found chat={chat_id} msg={msg_id}")
-            await response.write_eof()
-            return response
-
-        logger.info(f"Streaming: {file_name} offset={offset}")
-
-        async for chunk in client.iter_download(
-            tl_msg,
-            offset=offset,
-            chunk_size=512 * 1024   # 512KB per chunk
-        ):
-            await response.write(chunk)
+        async with aiohttp_client.ClientSession() as session:
+            async with session.get(direct_url, headers=req_headers) as tg_resp:
+                async for chunk in tg_resp.content.iter_chunked(512 * 1024):
+                    await response.write(chunk)
 
         await response.write_eof()
-        logger.info(f"✅ Stream complete: {file_name}")
+        logger.info(f"✅ Done: {file_name}")
 
     except ConnectionResetError:
         logger.info(f"Client disconnected: {file_name}")
     except Exception as e:
-        logger.error(f"Stream error: {e}", exc_info=True)
+        logger.error(f"Stream error: {e}")
 
     return response
 
@@ -236,12 +235,15 @@ async def process_batch(
             if message.video:
                 file_name = message.video.file_name or f"video_{i}.mp4"
                 file_size = message.video.file_size or 0
+                file_id   = message.video.file_id
             elif message.document:
                 file_name = message.document.file_name or f"file_{i}"
                 file_size = message.document.file_size or 0
+                file_id   = message.document.file_id
             elif message.audio:
                 file_name = message.audio.file_name or f"audio_{i}.mp3"
                 file_size = message.audio.file_size or 0
+                file_id   = message.audio.file_id
             else:
                 continue
 
@@ -254,7 +256,8 @@ async def process_batch(
                 chat_id   = chat_id,
                 msg_id    = message.message_id,
                 file_name = file_name,
-                file_size = file_size
+                file_size = file_size,
+                file_id   = file_id
             )
 
             download_url = f"{BASE_URL}/stream/{token}?download=1"
@@ -280,13 +283,11 @@ async def process_batch(
     text  = f"✅ *Ready Instantly!* ({success_count}/{total} files)\n"
     text += f"📦 Total size: {total_size_mb:.1f} MB\n"
     text += f"🔗 Links work permanently\n"
-    text += "\n"
-    text += "━━━━━━━━━━━━━━━━━━━━━━\n"
+    text += "\n━━━━━━━━━━━━━━━━━━━━━━\n"
     text += "⬇️ *DOWNLOAD LINKS*\n"
     text += "━━━━━━━━━━━━━━━━━━━━━━\n\n"
     text += "\n\n".join(download_lines)
-    text += "\n\n"
-    text += "━━━━━━━━━━━━━━━━━━━━━━\n"
+    text += "\n\n━━━━━━━━━━━━━━━━━━━━━━\n"
     text += "▶️ *STREAM LINKS*\n"
     text += "━━━━━━━━━━━━━━━━━━━━━━\n\n"
     text += "\n".join(stream_lines)
@@ -311,7 +312,6 @@ async def process_batch(
             await context.bot.send_message(
                 chat_id=chat_id, text=chunk, parse_mode="Markdown"
             )
-
         st_text  = "━━━━━━━━━━━━━━━━━━━━━━\n"
         st_text += "▶️ *STREAM LINKS*\n"
         st_text += "━━━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -323,9 +323,7 @@ async def process_batch(
 
 
 def split_message(text: str, limit: int = 4096) -> list:
-    lines   = text.split("\n")
-    chunks  = []
-    current = ""
+    lines, chunks, current = text.split("\n"), [], ""
     for line in lines:
         if len(current) + len(line) + 1 > limit:
             chunks.append(current)
@@ -348,7 +346,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "⚡ Instant stream and download links\n"
         "📦 Batch supported — 2 to 100 files\n"
         "🔗 Links work permanently\n"
-        "🚀 Fast streaming",
+        "🚀 Fast direct streaming",
         parse_mode="Markdown"
     )
 
@@ -390,7 +388,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_startup(app_obj):
     scheduler.start()
     await init_db()
-    await get_client()
     logger.info(f"✅ Bot ready! BASE_URL={BASE_URL}")
 
 
