@@ -202,12 +202,12 @@ async def process_batch(user_id: int, chat_id: int, context: ContextTypes.DEFAUL
             stream_url   = f"{BASE_URL}/stream/{token}"
 
             download_lines.append(
-                f"  {i}. `{file_name}`\n"
-                f"     🔗 {download_url}"
+               f"⬇️ *Video {i}* : `{file_name}`\n"
+                f"🔗 {download_url}"
             )
             stream_lines.append(
-                f"  {i}. `{file_name}`\n"
-                f"     🔗 [Stream Now]({stream_url})"
+                f"▶️ *Video {i}* : `{file_name}` — "
+                f"[Stream Now 🎬]({stream_url})"
             )
 
             logger.info(f"Processed {i}/{total}: {file_name}")
