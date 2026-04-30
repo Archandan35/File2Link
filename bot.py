@@ -233,7 +233,7 @@ async def process_batch(user_id: int, chat_id: int, context: ContextTypes.DEFAUL
    # ── Stream Section ──
     text += "\n\n"
     text += "━━━━━━━━━━━━━━━━━━━━━━\n"
-    text += "▶️ *STREAM LINKS*\n"
+    text += "🎬 *STREAM LINKS*\n"
     text += "━━━━━━━━━━━━━━━━━━━━━━\n\n"
     text += "\n".join(stream_lines)
 
