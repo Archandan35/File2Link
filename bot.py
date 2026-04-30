@@ -7,7 +7,7 @@ import sqlite3
 import time
 
 from aiohttp import web
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 from telethon import TelegramClient
 from telethon.sessions import StringSession
@@ -22,9 +22,10 @@ SESSION_STRING = os.environ.get("SESSION_STRING")
 BASE_URL = os.environ.get("BASE_URL", "").rstrip("/")
 PORT = int(os.environ.get("PORT", "8080"))
 
-CHUNK_SIZE = 2 * 1024 * 1024  # 2MB
-LINK_EXPIRE_SECONDS = 3600  # 1 hour
-SECRET_KEY = "mysecurekey"  # change this
+CHUNK_SIZE = 2 * 1024 * 1024
+LINK_EXPIRE_SECONDS = 3600
+SECRET_KEY = "mysecurekey"
+AUTO_DELETE_SECONDS = int(os.environ.get("AUTO_DELETE_SECONDS", "0"))
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -54,11 +55,11 @@ def init_db():
         )
         """)
 
-def save_file(token, msg_id, file_name, file_size, expires_at):
+def save_file(token, msg_id, file_name, file_size, expires):
     with db() as conn:
         conn.execute(
             "INSERT OR REPLACE INTO files VALUES (?, ?, ?, ?, ?, ?)",
-            (token, msg_id, file_name, file_size, time.time(), expires_at)
+            (token, msg_id, file_name, file_size, time.time(), expires)
         )
 
 def get_file(token):
@@ -70,14 +71,19 @@ def get_file(token):
 
 def increase_download(token):
     with db() as conn:
-        conn.execute("INSERT OR IGNORE INTO stats (token, downloads) VALUES (?, 0)", (token,))
+        conn.execute("INSERT OR IGNORE INTO stats VALUES (?, 0)", (token,))
         conn.execute("UPDATE stats SET downloads = downloads + 1 WHERE token=?", (token,))
+
+def get_downloads(token):
+    with db() as conn:
+        row = conn.execute("SELECT downloads FROM stats WHERE token=?", (token,)).fetchone()
+        return row[0] if row else 0
 
 # ── TELETHON ───────────────────────────
 def get_client():
     return TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 
-# ── STREAM HANDLER ─────────────────────
+# ── STREAM ─────────────────────────────
 async def stream_handler(request):
     token = request.match_info.get("token")
     key = request.query.get("key")
@@ -89,9 +95,9 @@ async def stream_handler(request):
     if not row:
         return web.Response(status=404, text="Link not found")
 
-    msg_id, file_name, file_size, expires_at = row
+    msg_id, file_name, file_size, expires = row
 
-    if expires_at and time.time() > expires_at:
+    if expires and time.time() > expires:
         return web.Response(status=403, text="Link expired")
 
     increase_download(token)
@@ -108,60 +114,141 @@ async def stream_handler(request):
         "Content-Disposition": f'attachment; filename="{file_name}"',
         "Content-Type": "application/octet-stream",
         "Accept-Ranges": "bytes",
-        "Cache-Control": "no-cache",
     }
 
-    async def generator():
+    async def gen():
         async with get_client() as client:
             msg = await client.get_messages(CHANNEL_ID, ids=msg_id)
             async for chunk in client.iter_download(msg, offset=offset, chunk_size=CHUNK_SIZE):
                 yield chunk
 
-    return web.Response(status=206 if range_header else 200, headers=headers, body=generator())
+    return web.Response(status=206 if range_header else 200, headers=headers, body=gen())
 
-# ── BOT LOGIC ──────────────────────────
+# ── BATCH SYSTEM ───────────────────────
+batch_store = {}
+BATCH_WAIT = 3
+
+def split_message(text, limit=4000):
+    return [text[i:i+limit] for i in range(0, len(text), limit)]
+
+async def process_batch(user_id, chat_id, context):
+    await asyncio.sleep(BATCH_WAIT)
+
+    if user_id not in batch_store:
+        return
+
+    messages = batch_store[user_id]["messages"]
+    del batch_store[user_id]
+
+    total = len(messages)
+    total_size = 0
+
+    download_lines = []
+    keyboard = []
+
+    for i, msg in enumerate(messages, 1):
+        if msg.video:
+            name = msg.video.file_name or f"video_{i}.mp4"
+            size = msg.video.file_size or 0
+        elif msg.document:
+            name = msg.document.file_name or f"file_{i}"
+            size = msg.document.file_size or 0
+        else:
+            continue
+
+        total_size += size
+
+        forwarded = await context.bot.forward_message(
+            chat_id=CHANNEL_ID,
+            from_chat_id=msg.chat_id,
+            message_id=msg.message_id
+        )
+
+        token = secrets.token_urlsafe(16)
+        expires = time.time() + LINK_EXPIRE_SECONDS
+
+        save_file(token, forwarded.message_id, name, size, expires)
+
+        url = f"{BASE_URL}/stream/{token}?key={SECRET_KEY}&download=1"
+
+        remaining = int((expires - time.time()) / 60)
+
+        download_lines.append(
+            f"♾️ *Video {i}*\n`{name}`\n⏳ Expires in: {remaining} min\n🔗 {url}\n📊 Downloads: {get_downloads(token)}"
+        )
+
+        keyboard.append([
+            InlineKeyboardButton(f"📥 Copy Link {i}", url=url)
+        ])
+
+    total_mb = total_size / (1024 * 1024)
+
+    text = (
+        f"✅ *Ready Instantly!* {total}/{total} file(s) ready\n"
+        f"📦 Total size: *{total_mb:.1f} MB*\n"
+        f"─────────────────────────\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"♾️ *DOWNLOAD LINKS*\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        + "\n\n".join(download_lines)
+    )
+
+    parts = split_message(text)
+
+    sent_msgs = []
+    for part in parts:
+        msg = await context.bot.send_message(
+            chat_id=chat_id,
+            text=part,
+            parse_mode="Markdown",
+            disable_web_page_preview=True,
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        sent_msgs.append(msg)
+
+    # auto delete
+    if AUTO_DELETE_SECONDS > 0:
+        await asyncio.sleep(AUTO_DELETE_SECONDS)
+        for m in sent_msgs:
+            try:
+                await context.bot.delete_message(chat_id, m.message_id)
+            except:
+                pass
+
+# ── BOT ───────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != MY_USER_ID:
         return
-    await update.message.reply_text("Send video/file to get download link.")
+    await update.message.reply_text("Send file(s) to get download links.")
 
 async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != MY_USER_ID:
         return
 
     msg = update.message
-
-    if msg.video:
-        file_name = msg.video.file_name or "video.mp4"
-        file_size = msg.video.file_size or 0
-    elif msg.document:
-        file_name = msg.document.file_name or "file.bin"
-        file_size = msg.document.file_size or 0
-    else:
+    if not (msg.video or msg.document):
         return
 
-    forwarded = await context.bot.forward_message(
-        chat_id=CHANNEL_ID,
-        from_chat_id=msg.chat_id,
-        message_id=msg.message_id
+    uid = update.effective_user.id
+
+    if uid not in batch_store:
+        batch_store[uid] = {"messages": [], "task": None}
+
+    batch_store[uid]["messages"].append(msg)
+
+    if batch_store[uid]["task"]:
+        batch_store[uid]["task"].cancel()
+
+    batch_store[uid]["task"] = asyncio.create_task(
+        process_batch(uid, update.effective_chat.id, context)
     )
 
-    token = secrets.token_urlsafe(16)
-    expires = time.time() + LINK_EXPIRE_SECONDS
-
-    save_file(token, forwarded.message_id, file_name, file_size, expires)
-
-    link = f"{BASE_URL}/stream/{token}?key={SECRET_KEY}&download=1"
-
-    await update.message.reply_text(f"🔗 Download:\n{link}")
-
-# ── MAIN ───────────────────────────────
+# ── MAIN ──────────────────────────────
 def main():
     init_db()
 
     app = web.Application()
     app.router.add_get("/stream/{token}", stream_handler)
-    app.router.add_get("/", lambda r: web.Response(text="Running"))
 
     loop = asyncio.get_event_loop()
     runner = web.AppRunner(app)
