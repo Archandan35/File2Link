@@ -202,7 +202,7 @@ async def process_batch(user_id: int, chat_id: int, context: ContextTypes.DEFAUL
             stream_url   = f"{BASE_URL}/stream/{token}"
 
             download_lines.append(
-               f"⬇️ *Video {i}* : `{file_name}`\n"
+               f"♾️ *Video {i}* : `{file_name}`\n"
                 f"🔗 {download_url}"
             )
             stream_lines.append(
@@ -226,7 +226,7 @@ async def process_batch(user_id: int, chat_id: int, context: ContextTypes.DEFAUL
     # ── Download Section ──
     text += "\n"
     text += "━━━━━━━━━━━━━━━━━━━━━━\n"
-    text += "⬇️ *DOWNLOAD LINKS*\n"
+    text += "♾️ *DOWNLOAD LINKS*\n"
     text += "━━━━━━━━━━━━━━━━━━━━━━\n\n"
     text += "\n\n".join(download_lines)
 
