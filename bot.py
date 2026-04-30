@@ -28,7 +28,7 @@ LINK_EXPIRE_SECONDS = 3600
 SECRET_KEY = "mysecurekey"
 
 MAX_FILES_PER_MESSAGE = 5
-WORKERS = 2  # safe parallel workers
+BATCH_WAIT = 3
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -102,6 +102,20 @@ async def stream_handler(request):
         body=gen()
     )
 
+# ── BATCH COLLECTOR ────────────────────
+batch_store = {}
+
+async def process_batch(user_id, chat_id, context):
+    await asyncio.sleep(BATCH_WAIT)
+
+    if user_id not in batch_store:
+        return
+
+    messages = batch_store[user_id]["messages"]
+    del batch_store[user_id]
+
+    await queue.put((messages, chat_id, context))
+
 # ── QUEUE SYSTEM ───────────────────────
 queue = asyncio.Queue()
 
@@ -115,9 +129,7 @@ async def process_job(messages, chat_id, context):
     total = len(messages)
     done = 0
 
-    progress_msg = await context.bot.send_message(
-        chat_id, f"⏳ Processing 0/{total}"
-    )
+    progress = await context.bot.send_message(chat_id, f"⏳ Processing 0/{total}")
 
     results = []
 
@@ -146,18 +158,15 @@ async def process_job(messages, chat_id, context):
         save_file(token, forwarded.message_id, name, size, time.time() + LINK_EXPIRE_SECONDS)
 
         url = f"{BASE_URL}/stream/{token}?key={SECRET_KEY}&download=1"
-
         results.append((name, url))
+
         done += 1
-
-        # progress update
-        await progress_msg.edit_text(f"⏳ Processing {done}/{total}")
-
+        await progress.edit_text(f"⏳ Processing {done}/{total}")
         await asyncio.sleep(0.6)
 
-    await progress_msg.edit_text(f"✅ Done {total}/{total}")
+    await progress.edit_text(f"✅ Done {total}/{total}")
 
-    # send in chunks
+    # 🔥 SPLIT INTO CHUNKS
     for i in range(0, len(results), MAX_FILES_PER_MESSAGE):
         chunk = results[i:i+MAX_FILES_PER_MESSAGE]
 
@@ -185,10 +194,22 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not (msg.video or msg.document):
         return
 
-    await queue.put(([msg], update.effective_chat.id, context))
+    uid = update.effective_user.id
+
+    if uid not in batch_store:
+        batch_store[uid] = {"messages": [], "task": None}
+
+    batch_store[uid]["messages"].append(msg)
+
+    if batch_store[uid]["task"]:
+        batch_store[uid]["task"].cancel()
+
+    batch_store[uid]["task"] = asyncio.create_task(
+        process_batch(uid, update.effective_chat.id, context)
+    )
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Send files.")
+    await update.message.reply_text("Send multiple files.")
 
 # ── MAIN ──────────────────────────────
 def main():
@@ -206,9 +227,7 @@ def main():
     tg.add_handler(CommandHandler("start", start))
     tg.add_handler(MessageHandler(filters.ALL, handle))
 
-    # start workers
-    for _ in range(WORKERS):
-        loop.create_task(worker())
+    loop.create_task(worker())
 
     tg.run_polling()
 
