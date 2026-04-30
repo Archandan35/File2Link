@@ -29,6 +29,9 @@ SECRET_KEY = "mysecurekey"  # change this
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# ── GLOBAL COUNTER ─────────────────────
+video_counter = 1
+
 # ── DATABASE ───────────────────────────
 DB = "files.db"
 
@@ -126,6 +129,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Send video/file to get download link.")
 
 async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global video_counter
+
     if update.effective_user.id != MY_USER_ID:
         return
 
@@ -153,7 +158,13 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     link = f"{BASE_URL}/stream/{token}?key={SECRET_KEY}&download=1"
 
-    await update.message.reply_text(f"🔗 Download:\n{link}")
+    # ✅ FINAL OUTPUT FORMAT
+    await update.message.reply_text(
+        f"🎬 Video {video_counter} : {file_name}\n"
+        f"🔗 {link}"
+    )
+
+    video_counter += 1
 
 # ── MAIN ───────────────────────────────
 def main():
