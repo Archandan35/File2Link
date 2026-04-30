@@ -26,8 +26,8 @@ API_HASH       = os.environ.get("API_HASH")
 SESSION_STRING = os.environ.get("SESSION_STRING", "")
 PORT           = int(os.environ.get("PORT", "8080"))
 BASE_URL       = os.environ.get("BASE_URL", "").rstrip("/")
-BATCH_WAIT     = 3
 DB_PATH        = os.environ.get("DB_PATH", "/tmp/filestore.db")
+BATCH_WAIT     = 3
 # ────────────────────────────────────────────────────────
 
 logging.basicConfig(
@@ -37,7 +37,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 scheduler   = AsyncIOScheduler()
 batch_store: dict = {}
-
 telethon_client: TelegramClient = None
 
 
@@ -66,7 +65,7 @@ async def save_token(token, chat_id, msg_id, file_name, file_size):
         await db.commit()
 
 
-async def get_token(token):
+async def get_token_entry(token):
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
             "SELECT chat_id, msg_id, file_name, file_size FROM files WHERE token=?",
@@ -99,10 +98,36 @@ def generate_token() -> str:
     return secrets.token_urlsafe(16)
 
 
+# ── Content Type Helper ────────────────────────────────
+def get_content_type(file_name: str, is_download: bool) -> tuple:
+    if is_download:
+        return (
+            f'attachment; filename="{file_name}"',
+            "application/octet-stream"
+        )
+    ext = file_name.lower().split(".")[-1]
+    content_types = {
+        "mp4":  "video/mp4",
+        "mkv":  "video/x-matroska",
+        "avi":  "video/x-msvideo",
+        "mov":  "video/quicktime",
+        "mp3":  "audio/mpeg",
+        "m4a":  "audio/mp4",
+        "pdf":  "application/pdf",
+        "jpg":  "image/jpeg",
+        "jpeg": "image/jpeg",
+        "png":  "image/png",
+    }
+    return (
+        f'inline; filename="{file_name}"',
+        content_types.get(ext, "video/mp4")
+    )
+
+
 # ── Web Server ─────────────────────────────────────────
-async def stream_handler(request: web.Request) -> web.Response:
+async def stream_handler(request: web.Request) -> web.StreamResponse:
     token = request.match_info.get("token")
-    entry = await get_token(token)
+    entry = await get_token_entry(token)
 
     if not entry:
         return web.Response(status=404, text="Link not found.")
@@ -112,6 +137,7 @@ async def stream_handler(request: web.Request) -> web.Response:
     file_name = entry["file_name"]
     file_size = entry["file_size"]
 
+    # Parse range header
     range_header = request.headers.get("Range")
     offset   = 0
     end_byte = file_size - 1 if file_size else None
@@ -122,63 +148,52 @@ async def stream_handler(request: web.Request) -> web.Response:
             offset   = int(match.group(1))
             end_byte = int(match.group(2)) if match.group(2) else file_size - 1
 
-    is_download = "download" in request.query
+    is_download              = "download" in request.query
+    disposition, content_type = get_content_type(file_name, is_download)
 
-    if is_download:
-        disposition  = f'attachment; filename="{file_name}"'
-        content_type = "application/octet-stream"
-    else:
-        disposition = f'inline; filename="{file_name}"'
-        ext = file_name.lower().split(".")[-1]
-        content_types = {
-            "mp4":  "video/mp4",
-            "mkv":  "video/x-matroska",
-            "avi":  "video/x-msvideo",
-            "mov":  "video/quicktime",
-            "mp3":  "audio/mpeg",
-            "m4a":  "audio/mp4",
-            "pdf":  "application/pdf",
-            "jpg":  "image/jpeg",
-            "jpeg": "image/jpeg",
-            "png":  "image/png",
+    # Use StreamResponse so bytes flow immediately to browser
+    response = web.StreamResponse(
+        status=206 if range_header else 200,
+        headers={
+            "Content-Disposition": disposition,
+            "Content-Type":        content_type,
+            "Accept-Ranges":       "bytes",
+            "Cache-Control":       "no-cache",
+            **({"Content-Length": str(end_byte - offset + 1)} if file_size else {}),
+            **({"Content-Range": f"bytes {offset}-{end_byte}/{file_size}"}
+               if range_header and file_size else {}),
         }
-        content_type = content_types.get(ext, "video/mp4")
-
-    headers = {
-        "Content-Disposition": disposition,
-        "Content-Type":        content_type,
-        "Accept-Ranges":       "bytes",
-    }
-
-    if file_size:
-        content_length = end_byte - offset + 1
-        headers["Content-Length"] = str(content_length)
-
-    status = 206 if range_header else 200
-    if range_header and file_size:
-        headers["Content-Range"] = f"bytes {offset}-{end_byte}/{file_size}"
-
-    async def file_generator():
-        try:
-            client = await get_client()
-            tl_msg = await client.get_messages(chat_id, ids=msg_id)
-            if tl_msg is None:
-                logger.error(f"Message not found chat={chat_id} msg={msg_id}")
-                return
-            async for chunk in client.iter_download(
-                tl_msg,
-                offset=offset,
-                chunk_size=512 * 1024
-            ):
-                yield chunk
-        except Exception as e:
-            logger.error(f"Stream error: {e}")
-
-    return web.Response(
-        status=status,
-        headers=headers,
-        body=file_generator()
     )
+
+    await response.prepare(request)
+
+    try:
+        client = await get_client()
+        tl_msg = await client.get_messages(chat_id, ids=msg_id)
+
+        if tl_msg is None:
+            logger.error(f"Message not found chat={chat_id} msg={msg_id}")
+            await response.write_eof()
+            return response
+
+        logger.info(f"Streaming: {file_name} offset={offset}")
+
+        async for chunk in client.iter_download(
+            tl_msg,
+            offset=offset,
+            chunk_size=512 * 1024   # 512KB per chunk
+        ):
+            await response.write(chunk)
+
+        await response.write_eof()
+        logger.info(f"✅ Stream complete: {file_name}")
+
+    except ConnectionResetError:
+        logger.info(f"Client disconnected: {file_name}")
+    except Exception as e:
+        logger.error(f"Stream error: {e}", exc_info=True)
+
+    return response
 
 
 async def index_handler(request: web.Request) -> web.Response:
@@ -233,12 +248,11 @@ async def process_batch(
             file_size_mb   = file_size / (1024 * 1024)
             total_size_mb += file_size_mb
 
-            # Save to database — survives restarts
             token = generate_token()
             await save_token(
-                token    = token,
-                chat_id  = chat_id,
-                msg_id   = message.message_id,
+                token     = token,
+                chat_id   = chat_id,
+                msg_id    = message.message_id,
                 file_name = file_name,
                 file_size = file_size
             )
@@ -255,10 +269,10 @@ async def process_batch(
                 f"[Stream Now 🎬]({stream_url})"
             )
 
-            logger.info(f"✅ {i}/{total}: {file_name} token={token}")
+            logger.info(f"✅ {i}/{total}: {file_name}")
 
         except Exception as e:
-            logger.error(f"❌ Failed file {i}: {e}", exc_info=True)
+            logger.error(f"❌ Failed {i}: {e}", exc_info=True)
             failed.append(i)
 
     success_count = total - len(failed)
@@ -266,13 +280,11 @@ async def process_batch(
     text  = f"✅ *Ready Instantly!* ({success_count}/{total} files)\n"
     text += f"📦 Total size: {total_size_mb:.1f} MB\n"
     text += f"🔗 Links work permanently\n"
-
     text += "\n"
     text += "━━━━━━━━━━━━━━━━━━━━━━\n"
     text += "⬇️ *DOWNLOAD LINKS*\n"
     text += "━━━━━━━━━━━━━━━━━━━━━━\n\n"
     text += "\n\n".join(download_lines)
-
     text += "\n\n"
     text += "━━━━━━━━━━━━━━━━━━━━━━\n"
     text += "▶️ *STREAM LINKS*\n"
@@ -291,29 +303,22 @@ async def process_batch(
             f"🔗 Links work permanently",
             parse_mode="Markdown"
         )
-
         dl_text  = "━━━━━━━━━━━━━━━━━━━━━━\n"
         dl_text += "⬇️ *DOWNLOAD LINKS*\n"
         dl_text += "━━━━━━━━━━━━━━━━━━━━━━\n\n"
         dl_text += "\n\n".join(download_lines)
-
         for chunk in split_message(dl_text):
             await context.bot.send_message(
-                chat_id=chat_id,
-                text=chunk,
-                parse_mode="Markdown"
+                chat_id=chat_id, text=chunk, parse_mode="Markdown"
             )
 
         st_text  = "━━━━━━━━━━━━━━━━━━━━━━\n"
         st_text += "▶️ *STREAM LINKS*\n"
         st_text += "━━━━━━━━━━━━━━━━━━━━━━\n\n"
         st_text += "\n".join(stream_lines)
-
         for chunk in split_message(st_text):
             await context.bot.send_message(
-                chat_id=chat_id,
-                text=chunk,
-                parse_mode="Markdown"
+                chat_id=chat_id, text=chunk, parse_mode="Markdown"
             )
 
 
@@ -343,7 +348,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "⚡ Instant stream and download links\n"
         "📦 Batch supported — 2 to 100 files\n"
         "🔗 Links work permanently\n"
-        "🚀 Fast streaming — persistent connection",
+        "🚀 Fast streaming",
         parse_mode="Markdown"
     )
 
