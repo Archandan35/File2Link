@@ -248,24 +248,17 @@ async def process_batch(user_id: int, chat_id: int, context: ContextTypes.DEFAUL
     # Build final message
     success_count = total - len(failed)
 
-expire_display = expires_at.strftime('%I:%M %p') if expires_at else "N/A"
+# Generate fresh expiry for each file
+            expires_at = datetime.now() + timedelta(minutes=DELETE_AFTER_MINUTES)
 
-    text  = f"✅ *Ready Instantly!* ({success_count}/{total} files)\n"
-    text += f"📦 Total size: {total_size_mb:.1f} MB\n"
-    text += f"⏰ Expires at: {expire_display}\n"
-    text += f"🗑 Auto-deleted in *{DELETE_AFTER_MINUTES} minutes*\n"
-
-    text += "\n"
-    text += "━━━━━━━━━━━━━━━━━━━━━━\n"
-    text += "⬇️ *DOWNLOAD LINKS*\n"
-    text += "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-    text += "\n\n".join(download_lines)
-
-    text += "\n\n"
-    text += "━━━━━━━━━━━━━━━━━━━━━━\n"
-    text += "▶️ *STREAM LINKS*\n"
-    text += "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-    text += "\n".join(stream_lines)
+            # Generate token and store
+            token = generate_token()
+            file_store[token] = {
+                "msg_id":     channel_msg_id,
+                "file_name":  file_name,
+                "file_size":  file_size,
+                "expires_at": expires_at,
+            }
 
     if failed:
         text += f"\n\n⚠️ Failed: Video(s) {', '.join(map(str, failed))}"
