@@ -223,11 +223,11 @@ async def process_batch(user_id: int, chat_id: int, context: ContextTypes.DEFAUL
             stream_url   = f"{BASE_URL}/stream/{token}"
 
             download_lines.append(
-                f"⬇️ *Video {i}* [{file_name}]({download_url}) "
-                f"_{file_size_mb:.1f}MB_"
+                f"⬇️ *Video {i}* : `{file_name}`\n"
+                f"🔗 {download_url}"
             )
             stream_lines.append(
-                f"▶️ *Video {i}* [Stream Now 🎬]({stream_url})"
+                f"▶️ *Video {i}* : `{file_name}` — [Stream Now 🎬]({stream_url})"
             )
 
             # Schedule auto-delete
