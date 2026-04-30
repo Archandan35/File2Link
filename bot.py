@@ -20,7 +20,6 @@ from telethon.sessions import StringSession
 
 # ── CONFIG ───────────────────────────────────────────────
 BOT_TOKEN            = os.environ.get("BOT_TOKEN")
-CHANNEL_ID           = int(os.environ.get("CHANNEL_ID"))
 MY_USER_ID           = int(os.environ.get("MY_USER_ID", "0"))
 API_ID               = int(os.environ.get("API_ID"))
 API_HASH             = os.environ.get("API_HASH")
@@ -29,7 +28,7 @@ DELETE_AFTER_MINUTES = int(os.environ.get("DELETE_AFTER_MINUTES", "60"))
 PORT                 = int(os.environ.get("PORT", "8080"))
 BASE_URL             = os.environ.get("BASE_URL", "").rstrip("/")
 BATCH_WAIT_SECONDS   = 3
-# ────────────────────────────────────────────────────────
+# ── CHANNEL_ID no longer needed ─────────────────────────
 
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -65,6 +64,7 @@ async def stream_handler(request: web.Request) -> web.Response:
         del file_store[token]
         return web.Response(status=410, text="Link has expired.")
 
+    chat_id   = entry["chat_id"]
     msg_id    = entry["msg_id"]
     file_name = entry["file_name"]
     file_size = entry["file_size"]
@@ -117,8 +117,10 @@ async def stream_handler(request: web.Request) -> web.Response:
 
     async def file_generator():
         async with get_telethon_client() as client:
-            tl_msg = await client.get_messages(CHANNEL_ID, ids=msg_id)
+            # Stream directly from bot chat — no channel needed
+            tl_msg = await client.get_messages(chat_id, ids=msg_id)
             if tl_msg is None:
+                logger.error(f"Message not found: chat={chat_id} msg={msg_id}")
                 return
             async for chunk in client.iter_download(
                 tl_msg,
@@ -138,14 +140,11 @@ async def index_handler(request: web.Request) -> web.Response:
     return web.Response(text="✅ Bot stream server is running.")
 
 
-# ── Delete Job ─────────────────────────────────────────
-async def delete_message_job(bot, chat_id, message_id, token):
-    try:
-        await bot.delete_message(chat_id=chat_id, message_id=message_id)
-        logger.info(f"✅ Deleted message {message_id}")
-    except Exception as e:
-        logger.warning(f"⚠️ Could not delete: {e}")
+# ── Delete job ─────────────────────────────────────────
+async def delete_token(token):
+    """Remove token from store after expiry."""
     file_store.pop(token, None)
+    logger.info(f"🗑 Token expired and removed: {token}")
 
 
 # ── Process Batch ──────────────────────────────────────
@@ -166,11 +165,11 @@ async def process_batch(
         return
 
     total = len(messages)
-    logger.info(f"Processing batch of {total} file(s) for user {user_id}")
+    logger.info(f"Processing batch of {total} file(s)")
 
     status_msg = await context.bot.send_message(
         chat_id=chat_id,
-        text=f"⏳ Processing *{total}* file(s)... Please wait.",
+        text=f"⏳ Processing *{total}* file(s)...",
         parse_mode="Markdown"
     )
 
@@ -178,7 +177,7 @@ async def process_batch(
     stream_lines   = []
     total_size_mb  = 0
     failed         = []
-    expires_at     = None
+    last_expires   = None
 
     for i, message in enumerate(messages, 1):
         try:
@@ -197,20 +196,16 @@ async def process_batch(
             file_size_mb   = file_size / (1024 * 1024)
             total_size_mb += file_size_mb
 
-            # Forward to private channel
-            forwarded = await context.bot.forward_message(
-                chat_id=CHANNEL_ID,
-                from_chat_id=message.chat_id,
-                message_id=message.message_id
-            )
-            channel_msg_id = forwarded.message_id
-
-            # Fresh expiry per file
+            # Generate token FIRST then set expiry
+            token      = generate_token()
             expires_at = datetime.now() + timedelta(minutes=DELETE_AFTER_MINUTES)
+            last_expires = expires_at
 
-            token = generate_token()
+            # Store with original chat_id and message_id
+            # No forwarding to channel at all
             file_store[token] = {
-                "msg_id":     channel_msg_id,
+                "chat_id":    chat_id,
+                "msg_id":     message.message_id,
                 "file_name":  file_name,
                 "file_size":  file_size,
                 "expires_at": expires_at,
@@ -228,29 +223,29 @@ async def process_batch(
                 f"[Stream Now 🎬]({stream_url})"
             )
 
-            # Schedule auto-delete
+            # Schedule token cleanup only (no message delete)
             scheduler.add_job(
-                delete_message_job,
+                delete_token,
                 "date",
                 run_date=expires_at,
-                args=[context.bot, CHANNEL_ID, channel_msg_id, token],
-                id=f"del_{channel_msg_id}"
+                args=[token],
+                id=f"del_{token}"
             )
 
-            logger.info(f"✅ Done {i}/{total}: {file_name}")
+            logger.info(f"✅ {i}/{total}: {file_name} token={token}")
 
         except Exception as e:
-            logger.error(f"❌ Failed file {i}: {e}")
+            logger.error(f"❌ Failed file {i}: {e}", exc_info=True)
             failed.append(i)
 
     success_count  = total - len(failed)
-    expire_display = expires_at.strftime("%I:%M %p") if expires_at else "N/A"
+    expire_display = last_expires.strftime("%I:%M %p") if last_expires else "N/A"
 
-    # ── Build final message ──
+    # ── Build message ──
     text  = f"✅ *Ready Instantly!* ({success_count}/{total} files)\n"
     text += f"📦 Total size: {total_size_mb:.1f} MB\n"
     text += f"⏰ Expires at: {expire_display}\n"
-    text += f"🗑 Auto-deleted in *{DELETE_AFTER_MINUTES} minutes*\n"
+    text += f"🗑 Links expire in *{DELETE_AFTER_MINUTES} minutes*\n"
 
     text += "\n"
     text += "━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -267,7 +262,6 @@ async def process_batch(
     if failed:
         text += f"\n\n⚠️ Failed: Video(s) {', '.join(map(str, failed))}"
 
-    # ── Send — split if too long ──
     if len(text) <= 4096:
         await status_msg.edit_text(text, parse_mode="Markdown")
     else:
@@ -275,12 +269,11 @@ async def process_batch(
             f"✅ *Ready!* {success_count}/{total} files\n"
             f"📦 Total: {total_size_mb:.1f} MB\n"
             f"⏰ Expires: {expire_display}\n"
-            f"🗑 Auto-deleted in *{DELETE_AFTER_MINUTES} minutes*",
+            f"🗑 Links expire in *{DELETE_AFTER_MINUTES} minutes*",
             parse_mode="Markdown"
         )
 
-        # Split download links into chunks of 4096
-        dl_text = "━━━━━━━━━━━━━━━━━━━━━━\n"
+        dl_text  = "━━━━━━━━━━━━━━━━━━━━━━\n"
         dl_text += "⬇️ *DOWNLOAD LINKS*\n"
         dl_text += "━━━━━━━━━━━━━━━━━━━━━━\n\n"
         dl_text += "\n\n".join(download_lines)
@@ -292,7 +285,7 @@ async def process_batch(
                 parse_mode="Markdown"
             )
 
-        st_text = "━━━━━━━━━━━━━━━━━━━━━━\n"
+        st_text  = "━━━━━━━━━━━━━━━━━━━━━━\n"
         st_text += "▶️ *STREAM LINKS*\n"
         st_text += "━━━━━━━━━━━━━━━━━━━━━━\n\n"
         st_text += "\n".join(stream_lines)
@@ -306,9 +299,8 @@ async def process_batch(
 
 
 def split_message(text: str, limit: int = 4096) -> list:
-    """Split long text into chunks under Telegram limit."""
-    lines  = text.split("\n")
-    chunks = []
+    lines   = text.split("\n")
+    chunks  = []
     current = ""
     for line in lines:
         if len(current) + len(line) + 1 > limit:
@@ -332,8 +324,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "⚡ Instant stream and download links\n"
         "📦 Batch supported — 2 to 100 files\n"
         "🔗 All links in one combined message\n"
-        "🗑 Auto-deletes after set time\n\n"
-        f"⏰ Delete time: *{DELETE_AFTER_MINUTES} minutes*",
+        "🗑 Links auto-expire after set time\n\n"
+        f"⏰ Expiry time: *{DELETE_AFTER_MINUTES} minutes*",
         parse_mode="Markdown"
     )
 
@@ -358,7 +350,6 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     batch_store[user_id]["messages"].append(message)
 
-    # Cancel existing timer and restart
     if batch_store[user_id]["task"]:
         batch_store[user_id]["task"].cancel()
 
