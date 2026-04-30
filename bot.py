@@ -27,7 +27,7 @@ SESSION_STRING = os.environ.get("SESSION_STRING", "")
 PORT           = int(os.environ.get("PORT", "8080"))
 BASE_URL       = os.environ.get("BASE_URL", "").rstrip("/")
 BATCH_WAIT     = 3
-DB_PATH        = "/tmp/filestore.db"
+DB_PATH        = os.environ.get("DB_PATH", "/tmp/filestore.db")
 # ────────────────────────────────────────────────────────
 
 logging.basicConfig(
