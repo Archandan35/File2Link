@@ -22,15 +22,12 @@ SESSION_STRING = os.environ.get("SESSION_STRING")
 BASE_URL = os.environ.get("BASE_URL", "").rstrip("/")
 PORT = int(os.environ.get("PORT", "8080"))
 
-CHUNK_SIZE = 2 * 1024 * 1024  # 2MB
-LINK_EXPIRE_SECONDS = 3600  # 1 hour
-SECRET_KEY = "mysecurekey"  # change this
+CHUNK_SIZE = 2 * 1024 * 1024
+LINK_EXPIRE_SECONDS = 3600
+SECRET_KEY = "mysecurekey"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-# ── GLOBAL COUNTER ─────────────────────
-video_counter = 1
 
 # ── DATABASE ───────────────────────────
 DB = "files.db"
@@ -56,6 +53,24 @@ def init_db():
             downloads INTEGER DEFAULT 0
         )
         """)
+
+        # ✅ Counter table
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS counter (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            value INTEGER
+        )
+        """)
+        conn.execute("INSERT OR IGNORE INTO counter (id, value) VALUES (1, 1)")
+
+def get_counter():
+    with db() as conn:
+        row = conn.execute("SELECT value FROM counter WHERE id=1").fetchone()
+        return row[0] if row else 1
+
+def increment_counter():
+    with db() as conn:
+        conn.execute("UPDATE counter SET value = value + 1 WHERE id=1")
 
 def save_file(token, msg_id, file_name, file_size, expires_at):
     with db() as conn:
@@ -129,8 +144,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Send video/file to get download link.")
 
 async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global video_counter
-
     if update.effective_user.id != MY_USER_ID:
         return
 
@@ -158,17 +171,20 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     link = f"{BASE_URL}/stream/{token}?key={SECRET_KEY}&download=1"
 
-    # Convert file size to MB
+    # ✅ Persistent counter
+    video_number = get_counter()
+
+    # Convert size
     size_mb = round(file_size / (1024 * 1024), 2)
 
-    # ✅ FINAL OUTPUT FORMAT
+    # ✅ FINAL OUTPUT
     await update.message.reply_text(
         f"📦 File Size : {size_mb} MB\n"
-        f"⬇️ Video {video_counter} : {file_name}\n"
+        f"⬇️ Video {video_number} : {file_name}\n"
         f"🔗 {link}"
     )
 
-    video_counter += 1
+    increment_counter()
 
 # ── MAIN ───────────────────────────────
 def main():
