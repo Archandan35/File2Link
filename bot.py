@@ -248,22 +248,19 @@ async def process_batch(user_id: int, chat_id: int, context: ContextTypes.DEFAUL
     # Build final message
     success_count = total - len(failed)
 
-    text  = f"✅ *Ready Instantly!* ({success_count}/{total} files)\n"
-    text += f"📦 Total size: {total_size_mb:.1f} MB\n"
-    text += f"⏰ Expires at: {expire_display}\n"
-    text += f"🗑 Auto-deleted in *{DELETE_AFTER_MINUTES} minutes*\n"
+    text = f"✅ *Ready Instantly!* ({success_count}/{total} files)\n"
+    text += f"📦 Total size: {total_size_mb:.1f} MB\n\n"
 
-    text += "\n"
-    text += "━━━━━━━━━━━━━━━━━━━━━━\n"
-    text += "⬇️ *DOWNLOAD LINKS*\n"
-    text += "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-    text += "\n\n".join(download_lines)
-
+    # Download links
+    text += "\n".join(download_lines)
     text += "\n\n"
-    text += "━━━━━━━━━━━━━━━━━━━━━━\n"
-    text += "▶️ *STREAM LINKS*\n"
-    text += "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+
+    # Stream links
     text += "\n".join(stream_lines)
+    text += "\n\n"
+
+    text += f"⏰ Expires at: {expires_at.strftime('%I:%M %p')}\n"
+    text += f"🗑 Auto-deleted in *{DELETE_AFTER_MINUTES} minutes*"
 
     if failed:
         text += f"\n\n⚠️ Failed: Video(s) {', '.join(map(str, failed))}"
