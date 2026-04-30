@@ -3,6 +3,7 @@ import re
 import asyncio
 import logging
 import secrets
+import aiosqlite
 
 from aiohttp import web
 from telegram import Update
@@ -26,6 +27,7 @@ SESSION_STRING = os.environ.get("SESSION_STRING", "")
 PORT           = int(os.environ.get("PORT", "8080"))
 BASE_URL       = os.environ.get("BASE_URL", "").rstrip("/")
 BATCH_WAIT     = 3
+DB_PATH        = "/tmp/filestore.db"
 # ────────────────────────────────────────────────────────
 
 logging.basicConfig(
@@ -33,14 +35,55 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
-scheduler  = AsyncIOScheduler()
-file_store:  dict = {}
+scheduler   = AsyncIOScheduler()
 batch_store: dict = {}
 
-# ── Single persistent Telethon client ─────────────────
 telethon_client: TelegramClient = None
 
 
+# ── Database ───────────────────────────────────────────
+async def init_db():
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS files (
+                token     TEXT PRIMARY KEY,
+                chat_id   INTEGER,
+                msg_id    INTEGER,
+                file_name TEXT,
+                file_size INTEGER
+            )
+        """)
+        await db.commit()
+    logger.info("✅ Database ready")
+
+
+async def save_token(token, chat_id, msg_id, file_name, file_size):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO files VALUES (?,?,?,?,?)",
+            (token, chat_id, msg_id, file_name, file_size)
+        )
+        await db.commit()
+
+
+async def get_token(token):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT chat_id, msg_id, file_name, file_size FROM files WHERE token=?",
+            (token,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            if row:
+                return {
+                    "chat_id":   row[0],
+                    "msg_id":    row[1],
+                    "file_name": row[2],
+                    "file_size": row[3],
+                }
+            return None
+
+
+# ── Telethon ───────────────────────────────────────────
 async def get_client() -> TelegramClient:
     global telethon_client
     if telethon_client is None or not telethon_client.is_connected():
@@ -48,7 +91,7 @@ async def get_client() -> TelegramClient:
             StringSession(SESSION_STRING), API_ID, API_HASH
         )
         await telethon_client.connect()
-        logger.info("✅ Telethon client connected")
+        logger.info("✅ Telethon connected")
     return telethon_client
 
 
@@ -59,11 +102,11 @@ def generate_token() -> str:
 # ── Web Server ─────────────────────────────────────────
 async def stream_handler(request: web.Request) -> web.Response:
     token = request.match_info.get("token")
+    entry = await get_token(token)
 
-    if token not in file_store:
+    if not entry:
         return web.Response(status=404, text="Link not found.")
 
-    entry     = file_store[token]
     chat_id   = entry["chat_id"]
     msg_id    = entry["msg_id"]
     file_name = entry["file_name"]
@@ -117,7 +160,6 @@ async def stream_handler(request: web.Request) -> web.Response:
 
     async def file_generator():
         try:
-            # Use persistent client — no reconnect delay
             client = await get_client()
             tl_msg = await client.get_messages(chat_id, ids=msg_id)
             if tl_msg is None:
@@ -191,14 +233,15 @@ async def process_batch(
             file_size_mb   = file_size / (1024 * 1024)
             total_size_mb += file_size_mb
 
-            # Generate token and store — no expiry
+            # Save to database — survives restarts
             token = generate_token()
-            file_store[token] = {
-                "chat_id":   chat_id,
-                "msg_id":    message.message_id,
-                "file_name": file_name,
-                "file_size": file_size,
-            }
+            await save_token(
+                token    = token,
+                chat_id  = chat_id,
+                msg_id   = message.message_id,
+                file_name = file_name,
+                file_size = file_size
+            )
 
             download_url = f"{BASE_URL}/stream/{token}?download=1"
             stream_url   = f"{BASE_URL}/stream/{token}"
@@ -212,7 +255,7 @@ async def process_batch(
                 f"[Stream Now 🎬]({stream_url})"
             )
 
-            logger.info(f"✅ {i}/{total}: {file_name}")
+            logger.info(f"✅ {i}/{total}: {file_name} token={token}")
 
         except Exception as e:
             logger.error(f"❌ Failed file {i}: {e}", exc_info=True)
@@ -220,9 +263,9 @@ async def process_batch(
 
     success_count = total - len(failed)
 
-    # ── Build message ──
     text  = f"✅ *Ready Instantly!* ({success_count}/{total} files)\n"
     text += f"📦 Total size: {total_size_mb:.1f} MB\n"
+    text += f"🔗 Links work permanently\n"
 
     text += "\n"
     text += "━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -244,7 +287,8 @@ async def process_batch(
     else:
         await status_msg.edit_text(
             f"✅ *Ready!* {success_count}/{total} files\n"
-            f"📦 Total: {total_size_mb:.1f} MB",
+            f"📦 Total: {total_size_mb:.1f} MB\n"
+            f"🔗 Links work permanently",
             parse_mode="Markdown"
         )
 
@@ -298,8 +342,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Forward any file or *multiple files at once*:\n"
         "⚡ Instant stream and download links\n"
         "📦 Batch supported — 2 to 100 files\n"
-        "🔗 Links never expire\n"
-        "🚀 Fast streaming — no reconnect delay",
+        "🔗 Links work permanently\n"
+        "🚀 Fast streaming — persistent connection",
         parse_mode="Markdown"
     )
 
@@ -340,7 +384,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def on_startup(app_obj):
     scheduler.start()
-    # Pre-connect Telethon on startup so first request is instant
+    await init_db()
     await get_client()
     logger.info(f"✅ Bot ready! BASE_URL={BASE_URL}")
 
