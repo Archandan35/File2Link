@@ -25,7 +25,9 @@ PORT = int(os.environ.get("PORT", "8080"))
 CHUNK_SIZE = 2 * 1024 * 1024
 LINK_EXPIRE_SECONDS = 3600
 SECRET_KEY = "mysecurekey"
-AUTO_DELETE_SECONDS = int(os.environ.get("AUTO_DELETE_SECONDS", "0"))
+
+BATCH_WAIT = 3
+MAX_FILES_PER_MESSAGE = 5
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -126,10 +128,6 @@ async def stream_handler(request):
 
 # ── BATCH SYSTEM ───────────────────────
 batch_store = {}
-BATCH_WAIT = 3
-
-def split_message(text, limit=4000):
-    return [text[i:i+limit] for i in range(0, len(text), limit)]
 
 async def process_batch(user_id, chat_id, context):
     await asyncio.sleep(BATCH_WAIT)
@@ -143,83 +141,70 @@ async def process_batch(user_id, chat_id, context):
     total = len(messages)
     total_size = 0
 
-    download_lines = []
-    keyboard = []
+    await context.bot.send_message(chat_id, f"⏳ Processing {total} files...")
 
-    for i, msg in enumerate(messages, 1):
-        if msg.video:
-            name = msg.video.file_name or f"video_{i}.mp4"
-            size = msg.video.file_size or 0
-        elif msg.document:
-            name = msg.document.file_name or f"file_{i}"
-            size = msg.document.file_size or 0
-        else:
-            continue
+    for start in range(0, total, MAX_FILES_PER_MESSAGE):
+        chunk = messages[start:start + MAX_FILES_PER_MESSAGE]
 
-        total_size += size
+        lines = []
+        keyboard = []
 
-        forwarded = await context.bot.forward_message(
-            chat_id=CHANNEL_ID,
-            from_chat_id=msg.chat_id,
-            message_id=msg.message_id
-        )
-
-        token = secrets.token_urlsafe(16)
-        expires = time.time() + LINK_EXPIRE_SECONDS
-
-        save_file(token, forwarded.message_id, name, size, expires)
-
-        url = f"{BASE_URL}/stream/{token}?key={SECRET_KEY}&download=1"
-
-        remaining = int((expires - time.time()) / 60)
-
-        download_lines.append(
-            f"♾️ *Video {i}*\n`{name}`\n⏳ Expires in: {remaining} min\n🔗 {url}\n📊 Downloads: {get_downloads(token)}"
-        )
-
-        keyboard.append([
-            InlineKeyboardButton(f"📥 Copy Link {i}", url=url)
-        ])
-
-    total_mb = total_size / (1024 * 1024)
-
-    text = (
-        f"✅ *Ready Instantly!* {total}/{total} file(s) ready\n"
-        f"📦 Total size: *{total_mb:.1f} MB*\n"
-        f"─────────────────────────\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"♾️ *DOWNLOAD LINKS*\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        + "\n\n".join(download_lines)
-    )
-
-    parts = split_message(text)
-
-    sent_msgs = []
-    for part in parts:
-        msg = await context.bot.send_message(
-            chat_id=chat_id,
-            text=part,
-            parse_mode="Markdown",
-            disable_web_page_preview=True,
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-        sent_msgs.append(msg)
-
-    # auto delete
-    if AUTO_DELETE_SECONDS > 0:
-        await asyncio.sleep(AUTO_DELETE_SECONDS)
-        for m in sent_msgs:
+        for i, msg in enumerate(chunk, start + 1):
             try:
-                await context.bot.delete_message(chat_id, m.message_id)
-            except:
-                pass
+                if msg.video:
+                    name = msg.video.file_name or f"video_{i}.mp4"
+                    size = msg.video.file_size or 0
+                elif msg.document:
+                    name = msg.document.file_name or f"file_{i}"
+                    size = msg.document.file_size or 0
+                else:
+                    continue
+
+                total_size += size
+
+                forwarded = await context.bot.forward_message(
+                    chat_id=CHANNEL_ID,
+                    from_chat_id=msg.chat_id,
+                    message_id=msg.message_id
+                )
+
+                await asyncio.sleep(0.6)
+
+                token = secrets.token_urlsafe(16)
+                expires = time.time() + LINK_EXPIRE_SECONDS
+
+                save_file(token, forwarded.message_id, name, size, expires)
+
+                url = f"{BASE_URL}/stream/{token}?key={SECRET_KEY}&download=1"
+
+                remaining = int((expires - time.time()) / 60)
+
+                lines.append(
+                    f"♾️ *Video {i}*\n`{name}`\n⏳ {remaining} min left\n🔗 {url}\n📊 {get_downloads(token)} downloads"
+                )
+
+                keyboard.append([
+                    InlineKeyboardButton(f"📥 Copy {i}", url=url)
+                ])
+
+            except Exception as e:
+                logger.error(e)
+
+        header = f"📦 Files {start+1}–{start+len(chunk)}\n━━━━━━━━━━━━━━━━━━\n\n"
+
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=header + "\n\n".join(lines),
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            disable_web_page_preview=True
+        )
 
 # ── BOT ───────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != MY_USER_ID:
         return
-    await update.message.reply_text("Send file(s) to get download links.")
+    await update.message.reply_text("Send multiple files to generate download links.")
 
 async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != MY_USER_ID:
