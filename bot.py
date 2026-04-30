@@ -24,7 +24,6 @@ MY_USER_ID           = int(os.environ.get("MY_USER_ID", "0"))
 API_ID               = int(os.environ.get("API_ID"))
 API_HASH             = os.environ.get("API_HASH")
 SESSION_STRING       = os.environ.get("SESSION_STRING", "")
-DELETE_AFTER_MINUTES = int(os.environ.get("DELETE_AFTER_MINUTES", "60"))
 PORT                 = int(os.environ.get("PORT", "8080"))
 BASE_URL             = os.environ.get("BASE_URL", "").rstrip("/")
 BATCH_WAIT_SECONDS   = 3
@@ -239,7 +238,7 @@ async def process_batch(
             failed.append(i)
 
     success_count  = total - len(failed)
-    expire_display = last_expires.strftime("%I:%M %p") if last_expires else "N/A"
+    
 
     # ── Build message ──
     text  = f"✅ *Ready Instantly!* ({success_count}/{total} files)\n"
