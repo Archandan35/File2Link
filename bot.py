@@ -3,7 +3,6 @@ import re
 import asyncio
 import logging
 import secrets
-from datetime import datetime, timedelta
 
 from aiohttp import web
 from telegram import Update
@@ -14,23 +13,21 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 
 # ── CONFIG ───────────────────────────────────────────────
-BOT_TOKEN            = os.environ.get("BOT_TOKEN")
-CHANNEL_ID           = int(os.environ.get("CHANNEL_ID"))
-MY_USER_ID           = int(os.environ.get("MY_USER_ID", "0"))
-API_ID               = int(os.environ.get("API_ID"))
-API_HASH             = os.environ.get("API_HASH")
-SESSION_STRING       = os.environ.get("SESSION_STRING", "")
-DELETE_AFTER_MINUTES = int(os.environ.get("DELETE_AFTER_MINUTES", "60"))
-PORT                 = int(os.environ.get("PORT", "8080"))
-BASE_URL             = os.environ.get("BASE_URL", "").rstrip("/")
+BOT_TOKEN      = os.environ.get("BOT_TOKEN")
+CHANNEL_ID     = int(os.environ.get("CHANNEL_ID"))
+MY_USER_ID     = int(os.environ.get("MY_USER_ID", "0"))
+API_ID         = int(os.environ.get("API_ID"))
+API_HASH       = os.environ.get("API_HASH")
+SESSION_STRING = os.environ.get("SESSION_STRING", "")
+PORT           = int(os.environ.get("PORT", "8080"))
+BASE_URL       = os.environ.get("BASE_URL", "").rstrip("/")
 
 # How many seconds to wait to collect batch messages
-BATCH_WAIT_SECONDS   = 3
+BATCH_WAIT_SECONDS = 3
 # ────────────────────────────────────────────────────────
 
 logging.basicConfig(
@@ -38,9 +35,8 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
-scheduler = AsyncIOScheduler()
 
-# File store: token -> file info
+# File store: token -> file info (no expiry)
 file_store: dict = {}
 
 # Batch store: user_id -> {messages: [], task: asyncio.Task}
@@ -62,26 +58,21 @@ async def stream_handler(request: web.Request) -> web.Response:
     token = request.match_info.get("token")
 
     if token not in file_store:
-        return web.Response(status=404, text="Link expired or not found.")
+        return web.Response(status=404, text="Link not found.")
 
-    entry = file_store[token]
-
-    if datetime.now() > entry["expires_at"]:
-        del file_store[token]
-        return web.Response(status=410, text="Link has expired.")
-
+    entry     = file_store[token]
     msg_id    = entry["msg_id"]
     file_name = entry["file_name"]
     file_size = entry["file_size"]
 
     range_header = request.headers.get("Range")
-    offset = 0
+    offset   = 0
     end_byte = file_size - 1 if file_size else None
 
     if range_header and file_size:
         match = re.match(r"bytes=(\d+)-(\d*)", range_header)
         if match:
-            offset = int(match.group(1))
+            offset   = int(match.group(1))
             end_byte = int(match.group(2)) if match.group(2) else file_size - 1
 
     is_download = "download" in request.query
@@ -93,23 +84,23 @@ async def stream_handler(request: web.Request) -> web.Response:
         disposition = f'inline; filename="{file_name}"'
         ext = file_name.lower().split(".")[-1]
         content_types = {
-            "mp4": "video/mp4",
-            "mkv": "video/x-matroska",
-            "avi": "video/x-msvideo",
-            "mov": "video/quicktime",
-            "mp3": "audio/mpeg",
-            "m4a": "audio/mp4",
-            "pdf": "application/pdf",
-            "jpg": "image/jpeg",
+            "mp4":  "video/mp4",
+            "mkv":  "video/x-matroska",
+            "avi":  "video/x-msvideo",
+            "mov":  "video/quicktime",
+            "mp3":  "audio/mpeg",
+            "m4a":  "audio/mp4",
+            "pdf":  "application/pdf",
+            "jpg":  "image/jpeg",
             "jpeg": "image/jpeg",
-            "png": "image/png",
+            "png":  "image/png",
         }
         content_type = content_types.get(ext, "video/mp4")
 
     headers = {
         "Content-Disposition": disposition,
-        "Content-Type": content_type,
-        "Accept-Ranges": "bytes",
+        "Content-Type":        content_type,
+        "Accept-Ranges":       "bytes",
     }
 
     if file_size:
@@ -143,16 +134,6 @@ async def index_handler(request: web.Request) -> web.Response:
     return web.Response(text="✅ Bot stream server is running.")
 
 
-# ── Delete job ─────────────────────────────────────────
-async def delete_message_job(bot, chat_id, message_id, token):
-    try:
-        await bot.delete_message(chat_id=chat_id, message_id=message_id)
-        logger.info(f"✅ Deleted message {message_id}")
-    except Exception as e:
-        logger.warning(f"⚠️ Could not delete: {e}")
-    file_store.pop(token, None)
-
-
 # ── Process Batch ──────────────────────────────────────
 async def process_batch(user_id: int, chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     """Wait for BATCH_WAIT_SECONDS then process all collected messages."""
@@ -178,7 +159,6 @@ async def process_batch(user_id: int, chat_id: int, context: ContextTypes.DEFAUL
         parse_mode="Markdown"
     )
 
-    expires_at     = datetime.now() + timedelta(minutes=DELETE_AFTER_MINUTES)
     download_lines = []
     stream_lines   = []
     total_size_mb  = 0
@@ -210,33 +190,24 @@ async def process_batch(user_id: int, chat_id: int, context: ContextTypes.DEFAUL
             )
             channel_msg_id = forwarded.message_id
 
-            # Generate token and store
+            # Generate token and store (no expiry)
             token = generate_token()
             file_store[token] = {
-                "msg_id":     channel_msg_id,
-                "file_name":  file_name,
-                "file_size":  file_size,
-                "expires_at": expires_at,
+                "msg_id":    channel_msg_id,
+                "file_name": file_name,
+                "file_size": file_size,
             }
 
             download_url = f"{BASE_URL}/stream/{token}?download=1"
             stream_url   = f"{BASE_URL}/stream/{token}"
 
             download_lines.append(
-                f"⬇️ *Video {i}* : `{file_name}`\n"
-                f"🔗 {download_url}"
+                f"  {i}. `{file_name}`\n"
+                f"     🔗 {download_url}"
             )
             stream_lines.append(
-                f"▶️ *Video {i}* : `{file_name}` — [Stream Now 🎬]({stream_url})"
-            )
-
-            # Schedule auto-delete
-            scheduler.add_job(
-                delete_message_job,
-                "date",
-                run_date=expires_at,
-                args=[context.bot, CHANNEL_ID, channel_msg_id, token],
-                id=f"del_{channel_msg_id}"
+                f"  {i}. `{file_name}`\n"
+                f"     🔗 [Stream Now]({stream_url})"
             )
 
             logger.info(f"Processed {i}/{total}: {file_name}")
@@ -248,45 +219,47 @@ async def process_batch(user_id: int, chat_id: int, context: ContextTypes.DEFAUL
     # Build final message
     success_count = total - len(failed)
 
-    text = f"✅ *Ready Instantly!* ({success_count}/{total} files)\n"
-    text += f"📦 Total size: {total_size_mb:.1f} MB\n\n"
+    text  = f"✅ *Done!* {success_count}/{total} file(s) ready\n"
+    text += f"📦 Total size: *{total_size_mb:.1f} MB*\n"
+    text += "─────────────────────────\n\n"
 
-    # Download links
+    # ── Download Section ──
+    text += "⬇️ *DOWNLOAD LINKS*\n"
+    text += "─────────────────────────\n"
     text += "\n".join(download_lines)
     text += "\n\n"
 
-    # Stream links
+    # ── Stream Section ──
+    text += "▶️ *STREAM LINKS*\n"
+    text += "─────────────────────────\n"
     text += "\n".join(stream_lines)
-    text += "\n\n"
-
-    text += f"⏰ Expires at: {expires_at.strftime('%I:%M %p')}\n"
-    text += f"🗑 Auto-deleted in *{DELETE_AFTER_MINUTES} minutes*"
 
     if failed:
-        text += f"\n\n⚠️ Failed: Video(s) {', '.join(map(str, failed))}"
+        text += f"\n\n⚠️ *Failed:* file(s) {', '.join(map(str, failed))}"
 
-    # Telegram message limit is 4096 chars
-    # Split into chunks if too many files
+    # Telegram message limit is 4096 chars — split if needed
     if len(text) <= 4096:
         await status_msg.edit_text(text, parse_mode="Markdown")
     else:
-        # Send in multiple messages
         await status_msg.edit_text(
-            f"✅ *Ready!* {success_count} files processed.\n"
-            f"📦 Total: {total_size_mb:.1f} MB\n"
-            f"⏰ Expires: {expires_at.strftime('%I:%M %p')}\n\n"
-            f"_Links below:_",
+            f"✅ *Done!* {success_count} file(s) ready.\n"
+            f"📦 Total: *{total_size_mb:.1f} MB*\n\n"
+            "_Links sent below ↓_",
             parse_mode="Markdown"
         )
-        # Send download links
-        dl_text = "⬇️ *Download Links:*\n\n" + "\n".join(download_lines)
+
+        dl_text  = "⬇️ *DOWNLOAD LINKS*\n"
+        dl_text += "─────────────────────────\n"
+        dl_text += "\n".join(download_lines)
         await context.bot.send_message(
             chat_id=chat_id,
             text=dl_text,
             parse_mode="Markdown"
         )
-        # Send stream links
-        st_text = "▶️ *Stream Links:*\n\n" + "\n".join(stream_lines)
+
+        st_text  = "▶️ *STREAM LINKS*\n"
+        st_text += "─────────────────────────\n"
+        st_text += "\n".join(stream_lines)
         await context.bot.send_message(
             chat_id=chat_id,
             text=st_text,
@@ -303,10 +276,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👋 *Welcome!*\n\n"
         "Forward any file or *multiple files at once*:\n"
         "⚡ Get instant stream/download links\n"
-        "📦 Batch processing supported (2-100 files)\n"
-        "🔗 All links in one combined message\n"
-        "🗑 Auto-deletes after set time\n\n"
-        f"⏰ Delete time: *{DELETE_AFTER_MINUTES} minutes*",
+        "📦 Batch processing supported (2–100 files)\n"
+        "🔗 All links in one combined message\n\n"
+        "🔁 Links *never expire* — they stay active permanently.",
         parse_mode="Markdown"
     )
 
@@ -352,7 +324,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def on_startup(app_obj):
-    scheduler.start()
     logger.info(f"✅ Bot started! BASE_URL={BASE_URL}")
 
 
