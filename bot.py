@@ -95,9 +95,33 @@ async def stream_handler(request: web.Request) -> web.Response:
             ):
                 yield chunk
 
+    # Check if download or stream mode
+    is_download = "download" in request.query
+
+    if is_download:
+        disposition = f'attachment; filename="{file_name}"'
+        content_type = "application/octet-stream"
+    else:
+        disposition = f'inline; filename="{file_name}"'
+        # Set correct content type for streaming
+        ext = file_name.lower().split(".")[-1]
+        content_types = {
+            "mp4": "video/mp4",
+            "mkv": "video/x-matroska",
+            "avi": "video/x-msvideo",
+            "mov": "video/quicktime",
+            "mp3": "audio/mpeg",
+            "m4a": "audio/mp4",
+            "pdf": "application/pdf",
+            "jpg": "image/jpeg",
+            "jpeg": "image/jpeg",
+            "png": "image/png",
+        }
+        content_type = content_types.get(ext, "video/mp4")
+
     headers = {
-        "Content-Disposition": f'attachment; filename="{file_name}"',
-        "Content-Type": "application/octet-stream",
+        "Content-Disposition": disposition,
+        "Content-Type": content_type,
         "Accept-Ranges": "bytes",
     }
 
