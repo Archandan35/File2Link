@@ -8,7 +8,7 @@ import time
 
 from aiohttp import web
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters, ContextTypes
 from telegram.error import RetryAfter
 from telethon import TelegramClient
 from telethon.sessions import StringSession
@@ -23,170 +23,157 @@ SESSION_STRING = os.environ.get("SESSION_STRING")
 BASE_URL = os.environ.get("BASE_URL", "").rstrip("/")
 PORT = int(os.environ.get("PORT", "8080"))
 
+WORKERS = 3
 CHUNK_SIZE = 2 * 1024 * 1024
-LINK_EXPIRE_SECONDS = 3600
-SECRET_KEY = "mysecurekey"
-
-MAX_FILES_PER_MESSAGE = 5
-BATCH_WAIT = 3
+LINK_EXPIRE = 3600
+MAX_PER_MSG = 10
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ── DATABASE ───────────────────────────
-DB = "files.db"
+# ── DB ─────────────────────────────
+conn = sqlite3.connect("data.db", check_same_thread=False)
+cur = conn.cursor()
 
-def db():
-    return sqlite3.connect(DB)
+cur.execute("""
+CREATE TABLE IF NOT EXISTS jobs(
+id INTEGER PRIMARY KEY AUTOINCREMENT,
+user_id INT,
+chat_id INT,
+msg_id INT,
+status TEXT
+)
+""")
 
-def init_db():
-    with db() as conn:
-        conn.execute("""
-        CREATE TABLE IF NOT EXISTS files (
-            token TEXT PRIMARY KEY,
-            msg_id INTEGER,
-            file_name TEXT,
-            file_size INTEGER,
-            created_at REAL,
-            expires_at REAL
-        )
-        """)
+cur.execute("""
+CREATE TABLE IF NOT EXISTS files(
+token TEXT PRIMARY KEY,
+msg_id INT,
+name TEXT,
+size INT,
+expires REAL
+)
+""")
 
-def save_file(token, msg_id, file_name, file_size, expires):
-    with db() as conn:
-        conn.execute(
-            "INSERT OR REPLACE INTO files VALUES (?, ?, ?, ?, ?, ?)",
-            (token, msg_id, file_name, file_size, time.time(), expires)
-        )
+conn.commit()
 
-def get_file(token):
-    with db() as conn:
-        return conn.execute(
-            "SELECT msg_id, file_name, file_size, expires_at FROM files WHERE token=?",
-            (token,)
-        ).fetchone()
-
-# ── TELETHON ───────────────────────────
-def get_client():
+# ── TELETHON ─────────────────────────
+def client():
     return TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 
-# ── STREAM ─────────────────────────────
+# ── STREAM ─────────────────────────
 async def stream_handler(request):
-    token = request.match_info.get("token")
-    key = request.query.get("key")
+    token = request.match_info["token"]
+    row = cur.execute("SELECT msg_id,name,size,expires FROM files WHERE token=?", (token,)).fetchone()
 
-    if key != SECRET_KEY:
-        return web.Response(status=403, text="Unauthorized")
-
-    row = get_file(token)
     if not row:
-        return web.Response(status=404, text="Link not found")
+        return web.Response(text="Not found", status=404)
 
-    msg_id, file_name, file_size, expires = row
-
-    if expires and time.time() > expires:
-        return web.Response(status=403, text="Expired")
+    msg_id, name, size, exp = row
+    if time.time() > exp:
+        return web.Response(text="Expired", status=403)
 
     async def gen():
-        async with get_client() as client:
-            msg = await client.get_messages(CHANNEL_ID, ids=msg_id)
-            async for chunk in client.iter_download(msg, chunk_size=CHUNK_SIZE):
+        async with client() as c:
+            msg = await c.get_messages(CHANNEL_ID, ids=msg_id)
+            async for chunk in c.iter_download(msg, chunk_size=CHUNK_SIZE):
                 yield chunk
 
     return web.Response(
         headers={
-            "Content-Disposition": f'attachment; filename="{file_name}"',
+            "Content-Disposition": f'attachment; filename="{name}"',
             "Content-Type": "application/octet-stream",
             "Accept-Ranges": "bytes"
         },
         body=gen()
     )
 
-# ── BATCH COLLECTOR ────────────────────
-batch_store = {}
+# ── PROGRESS BAR ─────────────────────
+def progress_bar(done, total):
+    percent = int((done/total)*10)
+    bar = "█"*percent + "░"*(10-percent)
+    return f"[{bar}] {done}/{total}"
 
-async def process_batch(user_id, chat_id, context):
-    await asyncio.sleep(BATCH_WAIT)
-
-    if user_id not in batch_store:
-        return
-
-    messages = batch_store[user_id]["messages"]
-    del batch_store[user_id]
-
-    await queue.put((messages, chat_id, context))
-
-# ── QUEUE SYSTEM ───────────────────────
+# ── WORKER ─────────────────────────
 queue = asyncio.Queue()
 
 async def worker():
     while True:
         job = await queue.get()
-        await process_job(*job)
+        await process(job)
         queue.task_done()
 
-async def process_job(messages, chat_id, context):
+async def process(job):
+    messages, chat_id, context = job
     total = len(messages)
     done = 0
 
-    progress = await context.bot.send_message(chat_id, f"⏳ Processing 0/{total}")
+    progress_msg = await context.bot.send_message(chat_id, "⏳ Starting...")
 
     results = []
 
-    for msg in messages:
+    for i, msg in enumerate(messages, 1):
+        # retry system
         while True:
             try:
-                forwarded = await context.bot.forward_message(
+                fwd = await context.bot.forward_message(
                     chat_id=CHANNEL_ID,
                     from_chat_id=msg.chat_id,
                     message_id=msg.message_id
                 )
                 break
             except RetryAfter as e:
-                await asyncio.sleep(e.retry_after + 1)
+                await asyncio.sleep(e.retry_after+1)
             except Exception:
                 await asyncio.sleep(2)
 
-        if msg.video:
-            name = msg.video.file_name or "video.mp4"
-            size = msg.video.file_size or 0
-        else:
-            name = msg.document.file_name or "file.bin"
-            size = msg.document.file_size or 0
+        name = (msg.video.file_name if msg.video else msg.document.file_name) or f"file_{i}"
+        size = (msg.video.file_size if msg.video else msg.document.file_size) or 0
 
-        token = secrets.token_urlsafe(16)
-        save_file(token, forwarded.message_id, name, size, time.time() + LINK_EXPIRE_SECONDS)
+        token = secrets.token_urlsafe(12)
+        cur.execute("INSERT INTO files VALUES (?,?,?,?,?)",
+                    (token, fwd.message_id, name, size, time.time()+LINK_EXPIRE))
+        conn.commit()
 
-        url = f"{BASE_URL}/stream/{token}?key={SECRET_KEY}&download=1"
-        results.append((name, url))
+        url = f"{BASE_URL}/stream/{token}?download=1"
+        results.append((i,name,url))
 
         done += 1
-        await progress.edit_text(f"⏳ Processing {done}/{total}")
-        await asyncio.sleep(0.6)
 
-    await progress.edit_text(f"✅ Done {total}/{total}")
+        # progress update
+        try:
+            await progress_msg.edit_text(
+                f"⏳ Processing\n{progress_bar(done,total)}"
+            )
+        except:
+            pass
 
-    # 🔥 SPLIT INTO CHUNKS
-    for i in range(0, len(results), MAX_FILES_PER_MESSAGE):
-        chunk = results[i:i+MAX_FILES_PER_MESSAGE]
+        await asyncio.sleep(0.5)
 
+    await progress_msg.edit_text(f"✅ Done {total} files")
+
+    # send in chunks
+    for i in range(0, len(results), MAX_PER_MSG):
+        chunk = results[i:i+MAX_PER_MSG]
         text = ""
         keyboard = []
 
-        for idx, (name, url) in enumerate(chunk, i+1):
+        for idx,name,url in chunk:
             text += f"📦 *Video {idx}*\n`{name}`\n🔗 {url}\n\n"
             keyboard.append([InlineKeyboardButton(f"📥 Copy {idx}", url=url)])
 
         await context.bot.send_message(
-            chat_id=chat_id,
+            chat_id,
             text=text,
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(keyboard),
             disable_web_page_preview=True
         )
 
-# ── BOT ───────────────────────────────
-async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ── BATCH ─────────────────────────
+batch = {}
+
+async def collect(update, context):
     if update.effective_user.id != MY_USER_ID:
         return
 
@@ -196,25 +183,20 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     uid = update.effective_user.id
 
-    if uid not in batch_store:
-        batch_store[uid] = {"messages": [], "task": None}
+    if uid not in batch:
+        batch[uid] = []
 
-    batch_store[uid]["messages"].append(msg)
+    batch[uid].append(msg)
 
-    if batch_store[uid]["task"]:
-        batch_store[uid]["task"].cancel()
+    await asyncio.sleep(3)
 
-    batch_store[uid]["task"] = asyncio.create_task(
-        process_batch(uid, update.effective_chat.id, context)
-    )
+    if uid in batch:
+        msgs = batch[uid]
+        del batch[uid]
+        await queue.put((msgs, update.effective_chat.id, context))
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Send multiple files.")
-
-# ── MAIN ──────────────────────────────
+# ── MAIN ─────────────────────────
 def main():
-    init_db()
-
     app = web.Application()
     app.router.add_get("/stream/{token}", stream_handler)
 
@@ -224,10 +206,11 @@ def main():
     loop.run_until_complete(web.TCPSite(runner, "0.0.0.0", PORT).start())
 
     tg = ApplicationBuilder().token(BOT_TOKEN).build()
-    tg.add_handler(CommandHandler("start", start))
-    tg.add_handler(MessageHandler(filters.ALL, handle))
+    tg.add_handler(CommandHandler("start", lambda u,c: u.message.reply_text("Send files")))
+    tg.add_handler(MessageHandler(filters.ALL, collect))
 
-    loop.create_task(worker())
+    for _ in range(WORKERS):
+        loop.create_task(worker())
 
     tg.run_polling()
 
