@@ -223,11 +223,11 @@ async def process_batch(user_id: int, chat_id: int, context: ContextTypes.DEFAUL
             stream_url   = f"{BASE_URL}/stream/{token}"
 
             download_lines.append(
-                f"⬇️ *Video {i}* : `{file_name}`\n"
-                f"🔗 {download_url}"
+                f"⬇️ *Video {i}* [{file_name}]({download_url}) "
+                f"_{file_size_mb:.1f}MB_"
             )
             stream_lines.append(
-                f"▶️ *Video {i}* : `{file_name}` — [Stream Now 🎬]({stream_url})"
+                f"▶️ *Video {i}* [Stream Now 🎬]({stream_url})"
             )
 
             # Schedule auto-delete
@@ -248,17 +248,19 @@ async def process_batch(user_id: int, chat_id: int, context: ContextTypes.DEFAUL
     # Build final message
     success_count = total - len(failed)
 
-# Generate fresh expiry for each file
-            expires_at = datetime.now() + timedelta(minutes=DELETE_AFTER_MINUTES)
+    text = f"✅ *Ready Instantly!* ({success_count}/{total} files)\n"
+    text += f"📦 Total size: {total_size_mb:.1f} MB\n\n"
 
-            # Generate token and store
-            token = generate_token()
-            file_store[token] = {
-                "msg_id":     channel_msg_id,
-                "file_name":  file_name,
-                "file_size":  file_size,
-                "expires_at": expires_at,
-            }
+    # Download links
+    text += "\n".join(download_lines)
+    text += "\n\n"
+
+    # Stream links
+    text += "\n".join(stream_lines)
+    text += "\n\n"
+
+    text += f"⏰ Expires at: {expires_at.strftime('%I:%M %p')}\n"
+    text += f"🗑 Auto-deleted in *{DELETE_AFTER_MINUTES} minutes*"
 
     if failed:
         text += f"\n\n⚠️ Failed: Video(s) {', '.join(map(str, failed))}"
