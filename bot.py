@@ -158,9 +158,13 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     link = f"{BASE_URL}/stream/{token}?key={SECRET_KEY}&download=1"
 
+    # Convert file size to MB
+    size_mb = round(file_size / (1024 * 1024), 2)
+
     # ✅ FINAL OUTPUT FORMAT
     await update.message.reply_text(
-        f"🎬 Video {video_counter} : {file_name}\n"
+        f"📦 File Size : {size_mb} MB\n"
+        f"⬇️ Video {video_counter} : {file_name}\n"
         f"🔗 {link}"
     )
 
