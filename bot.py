@@ -22,18 +22,24 @@ SESSION_STRING = os.environ.get("SESSION_STRING")
 BASE_URL = os.environ.get("BASE_URL", "").rstrip("/")
 PORT = int(os.environ.get("PORT", "8080"))
 
-CHUNK_SIZE = 1024 * 1024
+CHUNK_SIZE = 512 * 1024
 LINK_EXPIRE_SECONDS = 3600
 SECRET_KEY = os.environ.get("SECRET_KEY")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# ✅ Global Telegram Client
+tg_client = TelegramClient(
+    StringSession(SESSION_STRING),
+    API_ID,
+    API_HASH
+)
 # ── DATABASE ───────────────────────────
 DB = "files.db"
 
 def db():
-    return sqlite3.connect(DB)
+    return sqlite3.connect(DB, check_same_thread=False)
 
 def init_db():
     with db() as conn:
@@ -92,8 +98,7 @@ def increase_download(token):
         conn.execute("UPDATE stats SET downloads = downloads + 1 WHERE token=?", (token,))
 
 # ── TELETHON ───────────────────────────
-def get_client():
-    return TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+
 
 # ── STREAM HANDLER ─────────────────────
 async def stream_handler(request):
@@ -149,35 +154,38 @@ async def stream_handler(request):
 
     await response.prepare(request)
 
-    async with get_client() as client:
+    client = tg_client
 
-        msg = await client.get_messages(
-            CHANNEL_ID,
-            ids=msg_id
-        )
+    msg = await client.get_messages(
+        CHANNEL_ID,
+        ids=msg_id
+    )
 
-        downloaded = 0
+    downloaded = 0
 
-        async for chunk in client.iter_download(
-            msg,
-            offset=start,
-            request_size=CHUNK_SIZE
-        ):
+    async for chunk in client.iter_download(
+        msg,
+        offset=start,
+        request_size=CHUNK_SIZE
+    ):
 
-            if downloaded + len(chunk) > content_length:
-                chunk = chunk[:content_length - downloaded]
+        if downloaded + len(chunk) > content_length:
+            chunk = chunk[:content_length - downloaded]
 
-            downloaded += len(chunk)
+    downloaded += len(chunk)
 
-            await response.write(chunk)
+    try:
+        await response.write(chunk)
+    except:
+        break
 
-            if downloaded >= content_length:
-                break
+    if downloaded >= content_length:
+        break
 
     await response.write_eof()
 
     return response
-
+    
 # ── BOT LOGIC ──────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != MY_USER_ID:
@@ -243,7 +251,8 @@ def main():
     tg = ApplicationBuilder().token(BOT_TOKEN).build()
     tg.add_handler(CommandHandler("start", start))
     tg.add_handler(MessageHandler(filters.ALL, handle))
-
+    
+    loop.run_until_complete(tg_client.start())
     tg.run_polling()
 
 if __name__ == "__main__":
