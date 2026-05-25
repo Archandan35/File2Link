@@ -22,9 +22,9 @@ SESSION_STRING = os.environ.get("SESSION_STRING")
 BASE_URL = os.environ.get("BASE_URL", "").rstrip("/")
 PORT = int(os.environ.get("PORT", "8080"))
 
-CHUNK_SIZE = 2 * 1024 * 1024
+CHUNK_SIZE = 1024 * 1024
 LINK_EXPIRE_SECONDS = 3600
-SECRET_KEY = "mysecurekey"
+SECRET_KEY = os.environ.get("SECRET_KEY")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -104,6 +104,7 @@ async def stream_handler(request):
         return web.Response(status=403, text="Unauthorized")
 
     row = get_file(token)
+
     if not row:
         return web.Response(status=404, text="Link not found")
 
@@ -114,28 +115,68 @@ async def stream_handler(request):
 
     increase_download(token)
 
+    start = 0
+    end = file_size - 1
+
     range_header = request.headers.get("Range")
-    offset = 0
 
     if range_header:
-        match = re.match(r"bytes=(\d+)-", range_header)
+        match = re.match(r"bytes=(\d+)-(\d*)", range_header)
+
         if match:
-            offset = int(match.group(1))
+            start = int(match.group(1))
+
+            if match.group(2):
+                end = int(match.group(2))
+
+    content_length = end - start + 1
 
     headers = {
-        "Content-Disposition": f'attachment; filename="{file_name}"',
         "Content-Type": "application/octet-stream",
+        "Content-Disposition": f'attachment; filename="{file_name}"',
         "Accept-Ranges": "bytes",
+        "Content-Length": str(content_length),
+        "Content-Range": f"bytes {start}-{end}/{file_size}",
         "Cache-Control": "no-cache",
     }
 
-    async def generator():
-        async with get_client() as client:
-            msg = await client.get_messages(CHANNEL_ID, ids=msg_id)
-            async for chunk in client.iter_download(msg, offset=offset, chunk_size=CHUNK_SIZE):
-                yield chunk
+    status = 206 if range_header else 200
 
-    return web.Response(status=206 if range_header else 200, headers=headers, body=generator())
+    response = web.StreamResponse(
+        status=status,
+        headers=headers
+    )
+
+    await response.prepare(request)
+
+    async with get_client() as client:
+
+        msg = await client.get_messages(
+            CHANNEL_ID,
+            ids=msg_id
+        )
+
+        downloaded = 0
+
+        async for chunk in client.iter_download(
+            msg,
+            offset=start,
+            request_size=CHUNK_SIZE
+        ):
+
+            if downloaded + len(chunk) > content_length:
+                chunk = chunk[:content_length - downloaded]
+
+            downloaded += len(chunk)
+
+            await response.write(chunk)
+
+            if downloaded >= content_length:
+                break
+
+    await response.write_eof()
+
+    return response
 
 # ── BOT LOGIC ──────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
