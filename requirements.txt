@@ -4,3 +4,4 @@ aiohttp==3.9.5
 aiosqlite
 telethon==1.36.0
 cryptg
+tgcrypto
