@@ -101,6 +101,7 @@ def increase_download(token):
 
 
 # ── STREAM HANDLER ─────────────────────
+
 async def stream_handler(request):
     token = request.match_info.get("token")
     key = request.query.get("key")
@@ -172,15 +173,15 @@ async def stream_handler(request):
         if downloaded + len(chunk) > content_length:
             chunk = chunk[:content_length - downloaded]
 
-    downloaded += len(chunk)
+        downloaded += len(chunk)
 
-    try:
-        await response.write(chunk)
-    except:
-        break
+        try:
+            await response.write(chunk)
+        except:
+            break
 
-    if downloaded >= content_length:
-        break
+        if downloaded >= content_length:
+            break
 
     await response.write_eof()
 
