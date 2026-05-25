@@ -362,7 +362,10 @@ async def main():
 
     # Start Telethon
 
-    await tg_client.start()
+    await tg_client.connect()
+
+    if not await tg_client.is_user_authorized():
+    raise Exception("Invalid SESSION_STRING")
 
     logger.info("Telethon started")
 
