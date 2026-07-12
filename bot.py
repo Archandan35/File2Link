@@ -58,8 +58,17 @@ tg_client = TelegramClient(
 DB = "files.db"
 
 
+from contextlib import contextmanager
+
+
+@contextmanager
 def db():
-    return sqlite3.connect(DB, check_same_thread=False)
+    conn = sqlite3.connect(DB, check_same_thread=False)
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def init_db():
@@ -169,6 +178,19 @@ def increase_download(token):
             (token,)
         )
 
+# ───────────────── ERROR LOGGING MIDDLEWARE ─────────────────
+
+
+@web.middleware
+async def error_logging_middleware(request, handler):
+    try:
+        return await handler(request)
+    except web.HTTPException:
+        raise
+    except Exception:
+        logger.exception("Unhandled error on %s", request.path)
+        return web.Response(status=500, text="Internal server error")
+
 # ───────────────── STREAM HANDLER ─────────────────
 
 
@@ -200,6 +222,43 @@ async def stream_handler(request):
             text="Link expired"
         )
 
+    # ── Fetch and validate the source message BEFORE we send any
+    # response headers. If this fails we can still return a clean
+    # HTTP error instead of aborting a response that was already
+    # promised to the client (which is what produces "upstream error").
+
+    if not tg_client.is_connected():
+        try:
+            await tg_client.connect()
+        except Exception:
+            logger.exception("Failed to (re)connect Telethon client")
+            return web.Response(
+                status=502,
+                text="Storage backend unavailable, please try again."
+            )
+
+    try:
+        msg = await tg_client.get_messages(
+            CHANNEL_ID,
+            ids=msg_id
+        )
+    except Exception:
+        logger.exception("Failed to fetch message %s", msg_id)
+        return web.Response(
+            status=502,
+            text="Could not reach storage channel, please try again."
+        )
+
+    if not msg or not msg.media:
+        return web.Response(
+            status=404,
+            text=(
+                "File not found in storage channel "
+                "(it may have been deleted, or the bot account "
+                "no longer has access to it)."
+            )
+        )
+
     increase_download(token)
 
     start = 0
@@ -220,6 +279,15 @@ async def stream_handler(request):
 
             if match.group(2):
                 end = int(match.group(2))
+
+    # Guard against malformed/out-of-range Range headers, which would
+    # otherwise produce a negative/zero Content-Length and a broken response.
+    if start < 0 or end >= file_size or start > end:
+        return web.Response(
+            status=416,
+            headers={"Content-Range": f"bytes */{file_size}"},
+            text="Requested range not satisfiable"
+        )
 
     content_length = end - start + 1
 
@@ -247,32 +315,37 @@ async def stream_handler(request):
 
     await response.prepare(request)
 
-    msg = await tg_client.get_messages(
-        CHANNEL_ID,
-        ids=msg_id
-    )
-
     downloaded = 0
 
-    async for chunk in tg_client.iter_download(
-        msg,
-        offset=start,
-        request_size=CHUNK_SIZE
-    ):
+    try:
+        async for chunk in tg_client.iter_download(
+            msg,
+            offset=start,
+            request_size=CHUNK_SIZE
+        ):
 
-        if downloaded + len(chunk) > content_length:
-            chunk = chunk[:content_length - downloaded]
+            if downloaded + len(chunk) > content_length:
+                chunk = chunk[:content_length - downloaded]
 
-        downloaded += len(chunk)
+            downloaded += len(chunk)
 
-        try:
-            await response.write(chunk)
+            try:
+                await response.write(chunk)
 
-        except Exception:
-            break
+            except (ConnectionResetError, asyncio.CancelledError):
+                # Client disconnected/cancelled the download; nothing to do.
+                break
 
-        if downloaded >= content_length:
-            break
+            if downloaded >= content_length:
+                break
+
+    except Exception:
+        # Headers are already sent at this point, so we can't change the
+        # status code anymore. Just log it clearly so it's easy to diagnose
+        # in Railway logs instead of surfacing only as "upstream error".
+        logger.exception(
+            "Error while streaming token=%s msg_id=%s", token, msg_id
+        )
 
     try:
         await response.write_eof()
@@ -371,7 +444,7 @@ async def main():
 
     # AIOHTTP SERVER
 
-    app = web.Application()
+    app = web.Application(middlewares=[error_logging_middleware])
 
     app.router.add_get(
         "/stream/{token}",
