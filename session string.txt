@@ -1,0 +1,22 @@
+
+# run in google colab
+
+!pip install -q telethon nest_asyncio
+
+import nest_asyncio
+nest_asyncio.apply()
+
+import asyncio
+from telethon import TelegramClient
+from telethon.sessions import StringSession
+
+api_id = 26932049
+api_hash = ""  # Use a new API hash if you've exposed the old one
+
+async def generate():
+    async with TelegramClient(StringSession(), api_id, api_hash) as client:
+        print("\n✅ SESSION STRING:\n")
+        print(client.session.save())
+
+await generate()
+
