@@ -53,6 +53,19 @@ tg_client = TelegramClient(
     API_HASH
 )
 
+# Reference to the python-telegram-bot Bot instance, set once in main().
+# Used by the batching logic below to send messages outside of a
+# single update's context.
+TG_BOT = None
+
+# Buffers uploads per chat so that a batch of videos/files sent close
+# together (an album / multi-select, or just several sent quickly one
+# after another) get replied to with a single combined message instead
+# of one message per file.
+BATCH_WAIT_SECONDS = 2.0
+
+_pending_batches = {}  # chat_id -> {"items": [...], "task": asyncio.Task}
+
 # ───────────────── DATABASE ─────────────────
 
 DB = "files.db"
@@ -368,6 +381,85 @@ async def start(update: Update,
     )
 
 
+async def process_upload(item):
+    """Forward one file to the storage channel, save it, and return
+    the formatted text block for it."""
+
+    forwarded = await TG_BOT.forward_message(
+        chat_id=CHANNEL_ID,
+        from_chat_id=item["chat_id"],
+        message_id=item["message_id"]
+    )
+
+    token = secrets.token_urlsafe(16)
+
+    expires = time.time() + LINK_EXPIRE_SECONDS
+
+    save_file(
+        token,
+        forwarded.message_id,
+        item["file_name"],
+        item["file_size"],
+        expires
+    )
+
+    link = (
+        f"{BASE_URL}/stream/"
+        f"{token}?key={SECRET_KEY}&download=1"
+    )
+
+    video_number = get_counter()
+
+    increment_counter()
+
+    size_mb = round(item["file_size"] / (1024 * 1024), 2)
+
+    return (
+        f"📦 File Size : {size_mb} MB\n"
+        f"⬇️ Video {video_number} : {item['file_name']}\n"
+        f"🔗 {link}"
+    )
+
+
+async def flush_batch(chat_id):
+    await asyncio.sleep(BATCH_WAIT_SECONDS)
+
+    batch = _pending_batches.pop(chat_id, None)
+
+    if not batch:
+        return
+
+    items = batch["items"]
+
+    # Preserve the order files were actually sent in.
+    items.sort(key=lambda i: i["message_id"])
+
+    blocks = []
+
+    for item in items:
+        try:
+            blocks.append(await process_upload(item))
+        except Exception:
+            logger.exception(
+                "Failed to process upload %s in batch for chat %s",
+                item.get("file_name"), chat_id
+            )
+
+    if not blocks:
+        return
+
+    text = "\n\n".join(blocks)
+
+    # Telegram messages are capped at 4096 characters; split into
+    # multiple messages if a very large batch exceeds that.
+    for i in range(0, len(text), 4000):
+        await TG_BOT.send_message(
+            chat_id=chat_id,
+            text=text[i:i + 4000],
+            disable_web_page_preview=True
+        )
+
+
 async def handle(update: Update,
                  context: ContextTypes.DEFAULT_TYPE):
 
@@ -391,40 +483,27 @@ async def handle(update: Update,
     else:
         return
 
-    forwarded = await context.bot.forward_message(
-        chat_id=CHANNEL_ID,
-        from_chat_id=msg.chat_id,
-        message_id=msg.message_id
-    )
+    item = {
+        "chat_id": msg.chat_id,
+        "message_id": msg.message_id,
+        "file_name": file_name,
+        "file_size": file_size,
+    }
 
-    token = secrets.token_urlsafe(16)
+    batch = _pending_batches.get(msg.chat_id)
 
-    expires = time.time() + LINK_EXPIRE_SECONDS
+    if batch is None:
+        batch = {"items": [], "task": None}
+        _pending_batches[msg.chat_id] = batch
 
-    save_file(
-        token,
-        forwarded.message_id,
-        file_name,
-        file_size,
-        expires
-    )
+    batch["items"].append(item)
 
-    link = (
-        f"{BASE_URL}/stream/"
-        f"{token}?key={SECRET_KEY}&download=1"
-    )
+    # Any new file resets the quiet-period timer, so the batch only
+    # flushes once no new file has arrived for BATCH_WAIT_SECONDS.
+    if batch["task"]:
+        batch["task"].cancel()
 
-    video_number = get_counter()
-
-    size_mb = round(file_size / (1024 * 1024), 2)
-
-    await update.message.reply_text(
-        f"📦 File Size : {size_mb} MB\n"
-        f"⬇️ Video {video_number} : {file_name}\n"
-        f"🔗 {link}"
-    )
-
-    increment_counter()
+    batch["task"] = asyncio.create_task(flush_batch(msg.chat_id))
 
 # ───────────────── MAIN ─────────────────
 
@@ -473,6 +552,9 @@ async def main():
     # TELEGRAM BOT
 
     tg = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    global TG_BOT
+    TG_BOT = tg.bot
 
     tg.add_handler(CommandHandler("start", start))
 
